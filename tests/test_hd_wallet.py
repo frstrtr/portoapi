@@ -1,13 +1,13 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from src.core.crypto.hd_wallet_service import generate_address_from_xpub
+from core.crypto.hd_wallet_service import generate_address_from_xpub
 
 # src/core/crypto/test_hd_wallet_service.py
 
 
-@patch("src.core.crypto.hd_wallet_service.Bip44")
-@patch("src.core.crypto.hd_wallet_service.Bip44Coins")
-@patch("src.core.crypto.hd_wallet_service.Bip44Changes")
+@patch("core.crypto.hd_wallet_service.Bip44")
+@patch("core.crypto.hd_wallet_service.Bip44Coins")
+@patch("core.crypto.hd_wallet_service.Bip44Changes")
 def test_generate_address_from_xpub_basic(mock_changes, mock_coins, mock_bip44):
     # Setup mocks
     mock_pub_ctx = MagicMock()
@@ -37,9 +37,9 @@ def test_generate_address_from_xpub_basic(mock_changes, mock_coins, mock_bip44):
     mock_change_ctx.AddressIndex.assert_called_once_with(index)
     assert result == "TMockedAddress"
 
-@patch("src.core.crypto.hd_wallet_service.Bip44")
-@patch("src.core.crypto.hd_wallet_service.Bip44Coins")
-@patch("src.core.crypto.hd_wallet_service.Bip44Changes")
+@patch("core.crypto.hd_wallet_service.Bip44")
+@patch("core.crypto.hd_wallet_service.Bip44Coins")
+@patch("core.crypto.hd_wallet_service.Bip44Changes")
 def test_generate_address_from_xpub_default_account(mock_changes, mock_coins, mock_bip44):
     # Setup mocks as above
     mock_pub_ctx = MagicMock()
@@ -63,9 +63,9 @@ def test_generate_address_from_xpub_default_account(mock_changes, mock_coins, mo
     mock_pub_ctx.Account.assert_called_once_with(0)
     assert result == "TDefaultAccount"
 
-@patch("src.core.crypto.hd_wallet_service.Bip44")
-@patch("src.core.crypto.hd_wallet_service.Bip44Coins")
-@patch("src.core.crypto.hd_wallet_service.Bip44Changes")
+@patch("core.crypto.hd_wallet_service.Bip44")
+@patch("core.crypto.hd_wallet_service.Bip44Coins")
+@patch("core.crypto.hd_wallet_service.Bip44Changes")
 def test_generate_address_from_xpub_invalid_xpub(mock_changes, mock_coins, mock_bip44):
     # Simulate FromExtendedKey raising an exception
     mock_bip44.FromExtendedKey.side_effect = ValueError("Invalid xpub")
