@@ -1,0 +1,161 @@
+<!--
+  Isolated offline page for generating xPub from mnemonic, private key, or keystore file.
+  No external dependencies required after download.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>xPub Generator (Offline)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2em; }
+    input, textarea, button { margin: 0.5em 0; width: 100%; }
+    .result { background: #f4f4f4; padding: 1em; margin-top: 1em; word-break: break-all; }
+  </style>
+</head>
+<body>
+
+  <h2>Генерация xPub (Offline)</h2>
+  <p>Связь покупателей (buyer_id) с account (BIP44):</p>
+  <div style="margin-bottom:1em;">
+    <input id="buyer_id" type="text" placeholder="Buyer ID (например, email или username)" style="width:70%" />
+    <button onclick="assignAccount()">Назначить account</button>
+  </div>
+  <div id="buyersTable" style="margin-bottom:2em;"></div>
+  <p>Выберите способ:</p>
+  <button onclick="showMnemonic()">По мнемонике</button>
+  <button onclick="showPrivateKey()">По приватному ключу</button>
+  <button onclick="showKeystore()">По keystore-файлу</button>
+
+  <div id="mnemonicDiv" style="display:none;">
+    <h3>Мнемоника (BIP39)</h3>
+    <textarea id="mnemonic" rows="2" placeholder="Введите 12/24 слова..."></textarea>
+    <input id="account_mnemonic" type="number" min="0" value="0" placeholder="Account (по умолчанию 0)" />
+    <button onclick="generateFromMnemonic()">Сгенерировать xPub</button>
+  </div>
+  <div id="privDiv" style="display:none;">
+    <h3>Приватный ключ (hex)</h3>
+    <input id="privkey" type="text" placeholder="0x..." />
+    <input id="account_priv" type="number" min="0" value="0" placeholder="Account (по умолчанию 0)" />
+    <button onclick="generateFromPrivKey()">Сгенерировать xPub</button>
+  </div>
+  <div id="keystoreDiv" style="display:none;">
+    <h3>Keystore-файл (JSON)</h3>
+    <input type="file" id="keystoreFile" />
+    <input type="password" id="keystorePass" placeholder="Пароль" />
+    <input id="account_keystore" type="number" min="0" value="0" placeholder="Account (по умолчанию 0)" />
+    <button onclick="generateFromKeystore()">Сгенерировать xPub</button>
+  </div>
+
+  <div class="result" id="result"></div>
+
+  <!-- Embed required libraries for offline use -->
+  <script src="https://cdn.jsdelivr.net/npm/bip39@3.0.4/dist/bip39.browser.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/ethereumjs-wallet@1.0.1/dist/hdkey.min.js"></script>
+  <script>
+    // Simple in-memory mapping buyer_id <-> account
+    let buyerAccounts = JSON.parse(localStorage.getItem('buyerAccounts') || '{}');
+    function assignAccount() {
+      const buyer = document.getElementById('buyer_id').value.trim();
+      if (!buyer) return alert('Введите buyer_id!');
+      if (!(buyer in buyerAccounts)) {
+        // Назначаем следующий свободный account
+        let used = Object.values(buyerAccounts).map(Number);
+        let acc = 0;
+        while (used.includes(acc)) acc++;
+        buyerAccounts[buyer] = acc;
+        localStorage.setItem('buyerAccounts', JSON.stringify(buyerAccounts));
+      }
+      renderBuyersTable();
+      document.getElementById('account_mnemonic').value = buyerAccounts[buyer];
+      document.getElementById('account_priv').value = buyerAccounts[buyer];
+      document.getElementById('account_keystore').value = buyerAccounts[buyer];
+    }
+    function renderBuyersTable() {
+      let html = '<b>buyer_id → account</b><br><table border="1" style="width:100%;text-align:left;"><tr><th>buyer_id</th><th>account</th></tr>';
+      for (const [buyer, acc] of Object.entries(buyerAccounts)) {
+        html += `<tr><td>${buyer}</td><td>${acc}</td></tr>`;
+      }
+      html += '</table>';
+      document.getElementById('buyersTable').innerHTML = html;
+    }
+    window.onload = renderBuyersTable;
+    function showMnemonic() {
+      document.getElementById('mnemonicDiv').style.display = 'block';
+      document.getElementById('privDiv').style.display = 'none';
+      document.getElementById('keystoreDiv').style.display = 'none';
+      document.getElementById('result').innerText = '';
+    }
+    function showPrivateKey() {
+      document.getElementById('mnemonicDiv').style.display = 'none';
+      document.getElementById('privDiv').style.display = 'block';
+      document.getElementById('keystoreDiv').style.display = 'none';
+      document.getElementById('result').innerText = '';
+    }
+    function showKeystore() {
+      document.getElementById('mnemonicDiv').style.display = 'none';
+      document.getElementById('privDiv').style.display = 'none';
+      document.getElementById('keystoreDiv').style.display = 'block';
+      document.getElementById('result').innerText = '';
+    }
+    function generateFromMnemonic() {
+      const mnemonic = document.getElementById('mnemonic').value.trim();
+      const account = parseInt(document.getElementById('account_mnemonic').value) || 0;
+      if (!bip39.validateMnemonic(mnemonic)) {
+        document.getElementById('result').innerText = 'Некорректная мнемоника!';
+        return;
+      }
+      const seed = bip39.mnemonicToSeedSync(mnemonic);
+      const hdkey = ethereumjs.Wallet.hdkey.fromMasterSeed(seed);
+      // Tron: m/44'/195'/account'
+      const node = hdkey.derivePath(`m/44'/195'/${account}'`);
+      const xpub = node.publicExtendedKey;
+      let buyer = Object.keys(buyerAccounts).find(k => buyerAccounts[k] == account);
+      document.getElementById('result').innerText = `xPub: ${xpub}\nAccount: ${account}${buyer ? `\nСвязан с buyer_id: ${buyer}` : ''}`;
+    }
+    function generateFromPrivKey() {
+      try {
+        const priv = document.getElementById('privkey').value.trim().replace(/^0x/, '');
+        const account = parseInt(document.getElementById('account_priv').value) || 0;
+        if (!priv || priv.length !== 64) throw new Error('Некорректный приватный ключ!');
+        const hdkey = ethereumjs.Wallet.hdkey.fromMasterSeed(Buffer.from(priv, 'hex'));
+        const node = hdkey.derivePath(`m/44'/195'/${account}'`);
+        const xpub = node.publicExtendedKey;
+        let buyer = Object.keys(buyerAccounts).find(k => buyerAccounts[k] == account);
+        document.getElementById('result').innerText = `xPub: ${xpub}\nAccount: ${account}${buyer ? `\nСвязан с buyer_id: ${buyer}` : ''}`;
+      } catch (e) {
+        document.getElementById('result').innerText = e.message;
+      }
+    }
+    function generateFromKeystore() {
+      const fileInput = document.getElementById('keystoreFile');
+      const pass = document.getElementById('keystorePass').value;
+      const account = parseInt(document.getElementById('account_keystore').value) || 0;
+      if (!fileInput.files.length) {
+        document.getElementById('result').innerText = 'Выберите файл!';
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        try {
+          const keystore = JSON.parse(e.target.result);
+          ethereumjs.Wallet.fromV3(keystore, pass, true).then(wallet => {
+            const priv = wallet.getPrivateKey().toString('hex');
+            const hdkey = ethereumjs.Wallet.hdkey.fromMasterSeed(Buffer.from(priv, 'hex'));
+            const node = hdkey.derivePath(`m/44'/195'/${account}'`);
+            const xpub = node.publicExtendedKey;
+            let buyer = Object.keys(buyerAccounts).find(k => buyerAccounts[k] == account);
+            document.getElementById('result').innerText = `xPub: ${xpub}\nAccount: ${account}${buyer ? `\nСвязан с buyer_id: ${buyer}` : ''}`;
+          }).catch(err => {
+            document.getElementById('result').innerText = 'Ошибка: ' + err.message;
+          });
+        } catch (err) {
+          document.getElementById('result').innerText = 'Ошибка чтения файла: ' + err.message;
+        }
+      };
+      reader.readAsText(fileInput.files[0]);
+    }
+  </script>
+</body>
+</html>

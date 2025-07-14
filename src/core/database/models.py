@@ -1,10 +1,80 @@
+from sqlalchemy import UniqueConstraint
+class BuyerGroup(Base):
+    __tablename__ = 'buyer_groups'
+    id = Column(Integer, primary_key=True)
+    seller_id = Column(Integer, ForeignKey('sellers.telegram_id'))
+    buyer_id = Column(Text, nullable=False)
+    invoices_group = Column(Integer, nullable=False)  # BIP44 account
+    xpub = Column(Text, nullable=True)
+    __table_args__ = (UniqueConstraint('seller_id', 'buyer_id', name='uix_seller_buyer'),)
+    seller = relationship('Seller', back_populates='buyer_groups')
+    invoices = relationship('Invoice', back_populates='buyer_group')
+
 # Модели таблиц БД (SQLAlchemy/SQLModel)
 
 from sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
 
-# Example model
-# class Invoice(Base):
-#     __tablename__ = 'invoices'
-#     id = Column(Integer, primary_key=True)
+
+from sqlalchemy import Column, Integer, Text, Float, DateTime, ForeignKey, String
+from sqlalchemy.orm import relationship
+import datetime
+
+class Seller(Base):
+    __tablename__ = 'sellers'
+    telegram_id = Column(Integer, primary_key=True)
+    # xpub removed: now stored in Wallets table per invoices_group
+    gas_deposit_balance = Column(Float, default=0)
+    date_created = Column(DateTime, default=datetime.datetime.utcnow)
+    date_last_interacted = Column(DateTime, default=datetime.datetime.utcnow)
+    score = Column(Float, default=0)
+    invoices = relationship('Invoice', back_populates='seller')
+    wallets = relationship('Wallet', back_populates='seller')
+    buyer_groups = relationship('BuyerGroup', back_populates='seller')
+
+class Invoice(Base):
+    __tablename__ = 'invoices'
+    id = Column(Integer, primary_key=True)
+    seller_id = Column(Integer, ForeignKey('sellers.telegram_id'))
+    buyer_group_id = Column(Integer, ForeignKey('buyer_groups.id'))
+    derivation_index = Column(Integer, nullable=False)
+    address = Column(Text, unique=True, nullable=False)
+    amount = Column(Float, nullable=False)
+    status = Column(String(16), nullable=False, default='pending')  # 'pending', 'paid', 'expired'
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    seller = relationship('Seller', back_populates='invoices')
+    buyer_group = relationship('BuyerGroup', back_populates='invoices')
+    transactions = relationship('Transaction', back_populates='invoice')
+
+class Transaction(Base):
+    __tablename__ = 'transactions'
+    id = Column(Integer, primary_key=True)
+    invoice_id = Column(Integer, ForeignKey('invoices.id'))
+    tx_hash = Column(Text, unique=True, nullable=False)
+    sender_address = Column(Text, nullable=False)
+    amount_received = Column(Float, nullable=False)
+    received_at = Column(DateTime, default=datetime.datetime.utcnow)
+    invoice = relationship('Invoice', back_populates='transactions')
+
+
+class GasStation(Base):
+    __tablename__ = 'gas_stations'
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, ForeignKey('sellers.telegram_id'), unique=True)
+    is_active = Column(Integer, default=0)  # 0 - inactive, 1 - active
+    seller = relationship('Seller', back_populates='gas_station', uselist=False)
+
+
+class Wallet(Base):
+    __tablename__ = 'wallets'
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, ForeignKey('sellers.telegram_id'))
+    buyer_group_id = Column(Integer, ForeignKey('buyer_groups.id'), nullable=True)
+    invoices_group = Column(Integer, nullable=False, default=0)  # BIP44 account (group)
+    xpub = Column(Text, nullable=False)
+    seller = relationship('Seller', back_populates='wallets')
+    buyer_group = relationship('BuyerGroup')
+    balances = relationship('Balance', back_populates='wallet')
+    porto_token_balance = Column(Float, default=0)
+    USDT_tron_balance = Column(Float, default=0)
