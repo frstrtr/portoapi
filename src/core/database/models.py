@@ -1,12 +1,16 @@
 from sqlalchemy.orm import declarative_base
-
-
 from sqlalchemy import UniqueConstraint
 
 
 from sqlalchemy import Column, Integer, Text, Float, DateTime, ForeignKey, String
 from sqlalchemy.orm import relationship
 import datetime
+
+try:
+    UTC = datetime.UTC
+except AttributeError:
+    from datetime import timezone
+    UTC = timezone.utc
 
 
 Base = declarative_base()
@@ -18,7 +22,7 @@ class Balance(Base):
     wallet_id = Column(Integer, ForeignKey("wallets.id"))
     asset = Column(String(32), nullable=False)  # например, 'USDT', 'TRX'
     amount = Column(Float, default=0)
-    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
     wallet = relationship("Wallet", back_populates="balances")
 
 
@@ -44,8 +48,8 @@ class Seller(Base):
     telegram_id = Column(Integer, primary_key=True)
     # xpub removed: now stored in Wallets table per invoices_group
     gas_deposit_balance = Column(Float, default=0)
-    date_created = Column(DateTime, default=datetime.datetime.utcnow)
-    date_last_interacted = Column(DateTime, default=datetime.datetime.utcnow)
+    date_created = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
+    date_last_interacted = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
     score = Column(Float, default=0)
     invoices = relationship("Invoice", back_populates="seller")
     wallets = relationship("Wallet", back_populates="seller")
@@ -64,7 +68,7 @@ class Invoice(Base):
     status = Column(
         String(16), nullable=False, default="pending"
     )  # 'pending', 'paid', 'expired'
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
     seller = relationship("Seller", back_populates="invoices")
     buyer_group = relationship("BuyerGroup", back_populates="invoices")
     transactions = relationship("Transaction", back_populates="invoice")
@@ -77,7 +81,7 @@ class Transaction(Base):
     tx_hash = Column(Text, unique=True, nullable=False)
     sender_address = Column(Text, nullable=False)
     amount_received = Column(Float, nullable=False)
-    received_at = Column(DateTime, default=datetime.datetime.utcnow)
+    received_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
     invoice = relationship("Invoice", back_populates="transactions")
 
 
