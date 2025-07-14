@@ -1,0 +1,8 @@
+bip-utils>=2.9.0
+aiogram>=3.21.0
+tronpy
+fastapi
+uvicorn[standard]
+sqlalchemy
+bip_utils
+python-dotenv
