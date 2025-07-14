@@ -1,3 +1,19 @@
+# --- BUYER GROUPS CRUD ---
+def get_buyer_groups_by_seller(db, seller_id):
+    from .models import BuyerGroup
+    return db.query(BuyerGroup).filter(BuyerGroup.seller_id == seller_id).all()
+
+def get_buyer_group(db, seller_id, buyer_id):
+    from .models import BuyerGroup
+    return db.query(BuyerGroup).filter(BuyerGroup.seller_id == seller_id, BuyerGroup.buyer_id == buyer_id).first()
+
+def create_buyer_group(db, seller_id, buyer_id, invoices_group, xpub=None):
+    from .models import BuyerGroup
+    group = BuyerGroup(seller_id=seller_id, buyer_id=buyer_id, invoices_group=invoices_group, xpub=xpub)
+    db.add(group)
+    db.commit()
+    db.refresh(group)
+    return group
 # Функции для работы с базой данных
 
 
