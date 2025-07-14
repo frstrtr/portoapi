@@ -6,3 +6,7 @@ uvicorn[standard]
 sqlalchemy
 bip_utils
 python-dotenv
+
+#tests
+pytest
+pytest-asyncio

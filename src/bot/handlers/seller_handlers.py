@@ -62,9 +62,9 @@ async def process_invoice_description(message: types.Message, state: FSMContext)
         await message.answer("У вас нет групп покупателей. Сначала создайте группу через /add_buyer.")
         await state.clear()
         return
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb = types.ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
     for g in groups:
-        kb.add(f"{g.buyer_id} | {g.invoices_group}")
+        kb.keyboard.append([types.KeyboardButton(text=f"{g.buyer_id} | {g.invoices_group}")])
     await message.answer("Выберите покупателя/группу:", reply_markup=kb)
     await state.set_state(InvoiceFSM.group)
 
