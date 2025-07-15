@@ -140,6 +140,23 @@ def delete_wallet(db, wallet_id):
     db.delete(wallet)
     db.commit()
 
+def get_seller_wallet(db, seller_id, deposit_type):
+    return db.query(Wallet).filter_by(seller_id=seller_id, deposit_type=deposit_type).first()
+
+def create_seller_wallet(db, seller_id, address, derivation_path, deposit_type, xpub, account):
+    wallet = Wallet(
+        seller_id=seller_id,
+        address=address,
+        derivation_path=derivation_path,
+        deposit_type=deposit_type,
+        xpub=xpub,
+        account=account,
+    )
+    db.add(wallet)
+    db.commit()
+    db.refresh(wallet)
+    return wallet
+
 # --- GAS STATION CRUD ---
 def create_gas_station(db, **kwargs):
     gs = GasStation(**kwargs)

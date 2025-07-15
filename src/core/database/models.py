@@ -100,6 +100,9 @@ class Wallet(Base):
     buyer_group_id = Column(Integer, ForeignKey("buyer_groups.id"), nullable=True)
     invoices_group = Column(Integer, nullable=False, default=0)  # BIP44 account (group)
     xpub = Column(Text, nullable=False)
+    derivation_path = Column(Text, nullable=True)  # New: store derivation path
+    deposit_type = Column(String(16), nullable=True)  # New: TRX/USDT etc
+    account = Column(Integer, nullable=True)  # New: account in derivation path
     seller = relationship("Seller", back_populates="wallets")
     buyer_group = relationship("BuyerGroup")
     balances = relationship("Balance", back_populates="wallet")

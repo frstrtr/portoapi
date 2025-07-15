@@ -3,6 +3,8 @@
 
 from tronpy import Tron
 import time
+from src.core.database.db_service import get_seller_wallet, create_seller_wallet
+from tronpy.keys import HDPrivateKey
 
 # Приватный ключ газового кошелька (замените на реальный способ хранения)
 GAS_WALLET_PRIVATE_KEY = "YOUR_GAS_WALLET_PRIVATE_KEY"
@@ -107,3 +109,52 @@ def auto_activate_on_usdt_receive(invoice_address):
     except Exception as e:
         print(f"Error in auto_activate_on_usdt_receive: {e}")
         return False
+
+
+def get_or_create_tron_deposit_address(
+    db, seller_id, deposit_type="TRX", xpub=None, account=None
+):
+    # 1. Check if address already exists for this seller and deposit_type
+    wallet = get_seller_wallet(db, seller_id, deposit_type)
+    if wallet:
+        return wallet.address
+
+    # 2. Derive new address (account = seller_id or custom)
+    if account is None:
+        account = seller_id  # or another unique per-seller value
+
+    # Use xpub if provided, else derive from gas station private key
+    if xpub:
+        hdkey = HDPrivateKey.from_xpub(xpub)
+    else:
+        from .gas_station import GAS_WALLET_PRIVATE_KEY
+
+        hdkey = HDPrivateKey.from_private(GAS_WALLET_PRIVATE_KEY)
+
+    path = f"m/44'/195'/{account}'/0/0"
+    child = hdkey.derive_path(path)
+    address = child.public_key.to_base58check_address()
+
+    # 3. Save to DB
+    create_seller_wallet(
+        db=db,
+        seller_id=seller_id,
+        address=address,
+        derivation_path=path,
+        deposit_type=deposit_type,
+        xpub=xpub,
+        account=account,
+    )
+    return address
+
+
+def calculate_trx_needed(seller):
+    # Example: use seller.subscription or seller.tariff_plan
+    # You can expand this logic as needed
+    base_amount = 5  # Minimum for activation
+    if hasattr(seller, 'tariff_plan'):
+        if seller.tariff_plan == 'premium':
+            return 20
+        elif seller.tariff_plan == 'standard':
+            return 10
+    return base_amount
