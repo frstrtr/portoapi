@@ -66,7 +66,7 @@ print("Tron address (m/44'/195'/0'/0/0):", address)
 xpub = account.PublicKey().ToExtended()
 
 
-print("Tron xpub:", xpub)
+print("Tron MASTER xpub:", xpub)
 
 
 # Ask user how many addresses to generate from xpub

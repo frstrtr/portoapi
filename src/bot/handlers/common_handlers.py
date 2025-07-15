@@ -5,10 +5,27 @@ from aiogram import types
 
 
 async def handle_start(message: types.Message):
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("/register", "/deposit", "/balance")
-    kb.add("/create_invoice", "/sweep")
-    kb.add("/buyers", "/add_buyer")
+    kb = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                types.KeyboardButton(text="/help"),
+                types.KeyboardButton(text="/register")
+            ],
+            [
+                types.KeyboardButton(text="/deposit"),
+                types.KeyboardButton(text="/balance")
+            ],
+            [
+                types.KeyboardButton(text="/create_invoice"),
+                types.KeyboardButton(text="/sweep")
+            ],
+            [
+                types.KeyboardButton(text="/buyers"),
+                types.KeyboardButton(text="/add_buyer")
+            ]
+        ],
+        resize_keyboard=True
+    )
     await message.answer(
         "Добро пожаловать в платформу! Выберите действие:",
         reply_markup=kb

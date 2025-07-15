@@ -5,6 +5,7 @@ fastapi
 uvicorn[standard]
 sqlalchemy
 bip_utils
+qrcode
 python-dotenv
 
 #tests
