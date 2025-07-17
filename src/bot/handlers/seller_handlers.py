@@ -21,6 +21,8 @@ from src.core.database.db_service import (
     get_buyer_group,
     get_buyer_groups_by_seller,
     create_buyer_group,
+    create_seller_wallet,
+    update_seller,
 )
 from src.core.services.gas_station import prepare_for_sweep
 from src.core.crypto.xpub_validation import is_valid_xpub
@@ -35,11 +37,16 @@ logger = logging.getLogger("bot.seller_handlers")
 # pylint: disable=logging-fstring-interpolation
 
 
+# Import admin handlers
+from src.bot.admin.admin_handlers import handle_admin_xpubs, is_admin
+
+
 # FSM для создания инвойса с выбором группы
 class InvoiceFSM(StatesGroup):
     amount = State()
     description = State()
     group = State()
+    awaiting_group_name_for_invoice = State()
 
 
 # FSM для добавления покупателя/группы
@@ -55,12 +62,15 @@ class RegisterFSM(StatesGroup):
 
 
 async def handle_register(message: types.Message, state: FSMContext = None):
+    # Register admin command handler (should be in main_bot.py, but for demo, add here)
+    if message.text and message.text.startswith("/admin_xpubs"):
+        await handle_admin_xpubs(message)
+        return
     telegram_id = message.from_user.id
     db = message.bot.db
     seller = get_seller(db=db, telegram_id=telegram_id)
 
-
-    if seller and seller.xpub:  # or whatever field means "registered"
+    if seller and hasattr(seller, "xpub") and seller.xpub:
         await message.answer("Вы уже зарегистрированы. Ваш xPub сохранён.")
         return
 
@@ -97,7 +107,9 @@ async def handle_deposit(message: types.Message):
 
     deposit_address = get_or_create_tron_deposit_address(db, seller_id=telegram_id)
     trx_needed = calculate_trx_needed(seller)
-    logger.info(f"User {telegram_id} deposit address: {deposit_address}, TRX needed: {trx_needed}")
+    logger.info(
+        f"User {telegram_id} deposit address: {deposit_address}, TRX needed: {trx_needed}"
+    )
 
     qr = qrcode.QRCode(box_size=6, border=2)
     qr.add_data(deposit_address)
@@ -112,7 +124,10 @@ async def handle_deposit(message: types.Message):
         f"Рекомендуемая сумма для депозита: <b>{trx_needed} TRX</b>",
         parse_mode="HTML",
     )
-    await message.answer_photo(BufferedInputFile(buf.getvalue(), "deposit_qr.png"), caption="QR-код для депозита TRX")
+    await message.answer_photo(
+        BufferedInputFile(buf.getvalue(), "deposit_qr.png"),
+        caption="QR-код для депозита TRX",
+    )
 
 
 async def handle_balance(message: types.Message):
@@ -124,6 +139,8 @@ async def handle_balance(message: types.Message):
 
 
 async def handle_create_invoice(message: types.Message, state: FSMContext):
+    """Handle the /create_invoice command and start the invoice creation FSM."""
+
     telegram_id = message.from_user.id
     logger.info(f"User {telegram_id} called /create_invoice")
     await message.answer("Введите сумму для инвойса:")
@@ -131,6 +148,8 @@ async def handle_create_invoice(message: types.Message, state: FSMContext):
 
 
 async def process_invoice_amount(message: types.Message, state: FSMContext):
+    """Process the invoice amount input from the user."""
+
     telegram_id = message.from_user.id
     logger.info(f"User {telegram_id} entered invoice amount: {message.text}")
     await state.update_data(amount=message.text)
@@ -139,6 +158,9 @@ async def process_invoice_amount(message: types.Message, state: FSMContext):
 
 
 async def process_invoice_description(message: types.Message, state: FSMContext):
+    """Process the invoice description input from the user."""
+    print("Processing invoice description...")
+
     telegram_id = message.from_user.id
     logger.info(f"User {telegram_id} entered invoice description: {message.text}")
     await state.update_data(description=message.text)
@@ -147,16 +169,16 @@ async def process_invoice_description(message: types.Message, state: FSMContext)
     if not groups:
         logger.info(f"User {telegram_id} has no buyer groups")
         kb = types.ReplyKeyboardMarkup(
-    keyboard=[[types.KeyboardButton(text="Использовать группу по умолчанию")]],
-    resize_keyboard=True
-)
+            keyboard=[[types.KeyboardButton(text="Использовать группу по умолчанию")]],
+            resize_keyboard=True,
+        )
         await message.answer(
             "У вас нет групп покупателей. Хотите создать группу?\n"
             "Введите название для группы или нажмите кнопку ниже для использования названия по умолчанию (General):",
-            reply_markup=kb
+            reply_markup=kb,
         )
         await state.update_data(description=message.text)
-        await state.set_state("awaiting_group_name_for_invoice")
+        await state.set_state(InvoiceFSM.awaiting_group_name_for_invoice)
         return
     kb = types.ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
     for g in groups:
@@ -165,12 +187,23 @@ async def process_invoice_description(message: types.Message, state: FSMContext)
         )
     await message.answer("Выберите покупателя/группу:", reply_markup=kb)
     await state.set_state(InvoiceFSM.group)
+
+
 # --- Handler for group name after no groups found ---
 async def process_group_name_for_invoice(message: types.Message, state: FSMContext):
+    """
+    Process the group name input when no buyer groups are found."""
+    print("Processing group name for invoice creation...")
+
     telegram_id = message.from_user.id
     db = message.bot.db
     group_name = message.text.strip()
-    if group_name.lower() == "нет" or group_name == "Использовать группу по умолчанию" or not group_name:
+    normalized = group_name.lower().strip()
+    if (
+        normalized == "нет"
+        or normalized == "использовать группу по умолчанию"
+        or not normalized
+    ):
         group_name = "General"
     logger.info(f"User {telegram_id} creating default buyer group: {group_name}")
     # Create the group for this seller
@@ -182,7 +215,9 @@ async def process_group_name_for_invoice(message: types.Message, state: FSMConte
         kb.keyboard.append(
             [types.KeyboardButton(text=f"{g.buyer_id} | {g.invoices_group}")]
         )
-    await message.answer(f"Группа '{group_name}' создана. Выберите покупателя/группу:", reply_markup=kb)
+    await message.answer(
+        f"Группа '{group_name}' создана. Выберите покупателя/группу:", reply_markup=kb
+    )
     await state.set_state(InvoiceFSM.group)
 
 
@@ -196,12 +231,37 @@ async def process_invoice_group(message: types.Message, state: FSMContext):
         buyer_id = buyer_id.strip()
         invoices_group = int(invoices_group.strip())
     except Exception:
-        logger.warning(f"User {telegram_id} provided invalid group format: {message.text}")
+        logger.warning(
+            f"User {telegram_id} provided invalid group format: {message.text}"
+        )
         await message.answer("Некорректный формат. Выберите из списка.")
         return
     db = message.bot.db
 
     wallet = get_wallet_by_group(db, telegram_id, invoices_group)
+    if wallet is None:
+        logger.error(
+            f"User {telegram_id} tried to create invoice but has no wallet/xpub for group {invoices_group}."
+        )
+        # Show main actions keyboard including /register
+        kb = types.ReplyKeyboardMarkup(
+            keyboard=[
+                [types.KeyboardButton(text="/register")],
+                [types.KeyboardButton(text="/deposit")],
+                [types.KeyboardButton(text="/balance")],
+                [types.KeyboardButton(text="/create_invoice")],
+                [types.KeyboardButton(text="/buyers")],
+                [types.KeyboardButton(text="/add_buyer")],
+                [types.KeyboardButton(text="/sweep")],
+            ],
+            resize_keyboard=True,
+        )
+        await message.answer(
+            "❌ Ошибка: не найден xPub для вашего аккаунта или выбранной группы. Пожалуйста, зарегистрируйте xPub через /register.",
+            reply_markup=kb,
+        )
+        await state.clear()
+        return
     buyer_group = get_buyer_group(db, telegram_id, buyer_id)
     invoice = create_invoice(
         db=db,
@@ -212,7 +272,9 @@ async def process_invoice_group(message: types.Message, state: FSMContext):
         amount=float(data["amount"]),
         status="pending",
     )
-    logger.info(f"User {telegram_id} created invoice: address={invoice.address}, amount={data['amount']}, group={buyer_id}")
+    logger.info(
+        f"User {telegram_id} created invoice: address={invoice.address}, amount={data['amount']}, group={buyer_id}"
+    )
     await message.answer(
         f"Инвойс создан! Адрес: {invoice.address}\nСумма: {data['amount']}\nОписание: {data['description']}\nГруппа: {buyer_id}"
     )
@@ -258,11 +320,15 @@ async def process_add_buyer_group(message: types.Message, state: FSMContext):
     telegram_id = message.from_user.id
     data = await state.get_data()
     buyer_id = data["buyer_id"]
-    logger.info(f"User {telegram_id} entered group number: {message.text.strip()} for buyer_id: {buyer_id}")
+    logger.info(
+        f"User {telegram_id} entered group number: {message.text.strip()} for buyer_id: {buyer_id}"
+    )
     try:
         invoices_group = int(message.text.strip())
     except Exception:
-        logger.warning(f"User {telegram_id} provided invalid group number: {message.text.strip()}")
+        logger.warning(
+            f"User {telegram_id} provided invalid group number: {message.text.strip()}"
+        )
         await message.answer("Некорректный номер группы. Введите целое число.")
         return
     db = message.bot.db
@@ -297,7 +363,9 @@ async def handle_sweep(message: types.Message):
     # Здесь можно реализовать FSM для подтверждения
     # После подтверждения:
     for inv in paid_invoices:
-        logger.info(f"User {telegram_id} sweeping invoice {inv.id} address {inv.address}")
+        logger.info(
+            f"User {telegram_id} sweeping invoice {inv.id} address {inv.address}"
+        )
         prepare_for_sweep(inv.address)
         update_invoice(db=message.bot.db, invoice_id=inv.id, status="swept")
     await message.answer("Все оплаченные инвойсы обработаны и выведены.")
@@ -331,10 +399,29 @@ async def process_register_xpub(message: types.Message, state: FSMContext):
         # Валидация xPub
         if not is_valid_xpub(xpub):
             logger.warning(f"User {telegram_id} provided invalid xPub: {xpub}")
-            await message.answer("Некорректный xPub. Пожалуйста, проверьте и отправьте корректный xPub.")
+            await message.answer(
+                "Некорректный xPub. Пожалуйста, проверьте и отправьте корректный xPub."
+            )
             return
-        # Сохраните xPub в БД, привязав к seller
-        logger.info(f"User {telegram_id} xPub saved: {xpub}")
+        db = message.bot.db
+        seller = get_seller(db, telegram_id)
+        if seller:
+            update_seller(db, telegram_id, xpub=xpub)
+        else:
+            create_seller(db, telegram_id, xpub=xpub)
+        # Create Wallet for default group (0) if not exists
+        wallet = get_wallet_by_group(db, telegram_id, 0)
+        if not wallet:
+            create_seller_wallet(
+                db,
+                seller_id=telegram_id,
+                address=None,
+                derivation_path=None,
+                deposit_type=None,
+                xpub=xpub,
+                account=0,
+            )
+        logger.info(f"User {telegram_id} xPub saved and wallet created: {xpub}")
         # Клавиатура с основными действиями продавца
         kb = types.ReplyKeyboardMarkup(
             keyboard=[
@@ -343,9 +430,44 @@ async def process_register_xpub(message: types.Message, state: FSMContext):
                 [types.KeyboardButton(text="/create_invoice")],
                 [types.KeyboardButton(text="/buyers")],
                 [types.KeyboardButton(text="/add_buyer")],
-                [types.KeyboardButton(text="/sweep")]
+                [types.KeyboardButton(text="/sweep")],
             ],
-            resize_keyboard=True
+            resize_keyboard=True,
         )
-        await message.answer("Ваш xPub сохранён. Регистрация завершена!\nВыберите действие:", reply_markup=kb)
+        await message.answer(
+            "Ваш xPub сохранён. Регистрация завершена!\nВыберите действие:",
+            reply_markup=kb,
+        )
         await state.clear()
+
+
+# # --- Admin command: /admin_xpubs <seller_id> ---
+# async def handle_admin_xpubs(message: types.Message):
+#     telegram_id = message.from_user.id
+#     if not is_admin(telegram_id):
+#         await message.answer("⛔️ Нет доступа. Только для админов.")
+#         return
+#     args = message.text.strip().split()
+#     if len(args) != 2:
+#         await message.answer("Использование: /admin_xpubs <seller_id>")
+#         return
+#     try:
+#         seller_id = int(args[1])
+#     except Exception:
+#         await message.answer("seller_id должен быть числом.")
+#         return
+#     db = message.bot.db
+#     from src.core.database.db_service import SessionLocal
+
+#     wallets = (
+#         db.query(create_seller_wallet.__globals__["Wallet"])
+#         .filter_by(seller_id=seller_id)
+#         .all()
+#     )
+#     if not wallets:
+#         await message.answer(f"Нет xPub-кошельков для seller_id {seller_id}.")
+#         return
+#     text = f"xPubs для seller_id {seller_id}:\n"
+#     for w in wallets:
+#         text += f"- group: {w.invoices_group}, xpub: {w.xpub}\n"
+#     await message.answer(text)

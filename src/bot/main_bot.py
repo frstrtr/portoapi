@@ -1,3 +1,7 @@
+from src.bot.admin.admin_handlers import ADMINS
+import aiohttp
+from aiogram.exceptions import TelegramNetworkError
+from src.bot.admin.admin_handlers import handle_admin_xpubs
 # Main entrance point to start Telegram-bot
 
 import logging
@@ -56,11 +60,31 @@ def log_user_action(user: types.User, action: str, extra: str = ""):
 def log_and_handle(handler, action_name):
     @functools.wraps(handler)
     async def wrapper(message: types.Message, *args, **kwargs):
+        # Deduplication: Only handle each update_id once per process lifetime
+        if not hasattr(wrapper, 'handled_updates'):
+            wrapper.handled_updates = set()
+        update_id = getattr(message, 'update_id', None)
+        # If update_id is not available, fallback to message_id
+        unique_id = update_id if update_id is not None else getattr(message, 'message_id', None)
+        if unique_id is not None:
+            if unique_id in wrapper.handled_updates:
+                logger.debug(f"[Deduplication] Skipping duplicate update/message: {unique_id}")
+                return
+            wrapper.handled_updates.add(unique_id)
         log_user_action(message.from_user, action_name, f"text='{message.text}'")
-        return await handler(message, *args, **kwargs)
+        try:
+            return await handler(message, *args, **kwargs)
+        except (TelegramNetworkError, aiohttp.client_exceptions.ClientConnectorError) as net_err:
+            logger.error(f"[NetworkError] Handler '{action_name}' failed for user {message.from_user.id}: {net_err}")
+            # Optionally, notify admins here if desired
+        except Exception as e:
+            logger.exception(f"[HandlerError] Unexpected error in handler '{action_name}' for user {message.from_user.id}: {e}")
+        # Do not re-raise, so bot continues processing other updates
     return wrapper
 
 async def main():
+    # Register admin commands globally
+    dp.message.register(handle_admin_xpubs, lambda m: m.text and m.text.startswith("/admin_xpubs"))
     logger.info("Starting Telegram bot...")
 
     # Register handlers with logging
@@ -81,18 +105,48 @@ async def main():
     # Register handler for custom state awaiting_group_name_for_invoice
     dp.message.register(
         log_and_handle(seller_handlers.process_group_name_for_invoice, "group_name_for_invoice"),
-        State("awaiting_group_name_for_invoice")
+        seller_handlers.InvoiceFSM.awaiting_group_name_for_invoice
     )
     dp.message.register(log_and_handle(seller_handlers.process_add_buyer_id, "add_buyer_id"), seller_handlers.AddBuyerFSM.buyer_id)
     dp.message.register(log_and_handle(seller_handlers.process_add_buyer_group, "add_buyer_group"), seller_handlers.AddBuyerFSM.group_name)
 
-    try:
-        await dp.start_polling(bot)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("Bot shutdown requested. Shutting down gracefully...")
-    finally:
-        await bot.session.close()
-        logger.info("Bot stopped.")
+    max_retries = 10
+    base_delay = 5  # seconds
+    attempt = 0
+    notified_admins = False
+    while True:
+        try:
+            logger.info(f"Starting polling (attempt {attempt + 1})...")
+            await dp.start_polling(bot)
+            break  # Exit loop if polling ends normally
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            logger.info("Bot shutdown requested. Shutting down gracefully...")
+            break
+        except (aiohttp.client_exceptions.ClientConnectorError, TelegramNetworkError) as e:
+            attempt += 1
+            delay = min(base_delay * (2 ** (attempt - 1)), 300)  # Cap at 5 min
+            logger.error(f"[RETRY] Network error: Cannot connect to Telegram API (attempt {attempt}/{max_retries}): {e}")
+            print(f"[ERROR] Cannot connect to Telegram API. Retry {attempt}/{max_retries} in {delay} seconds.")
+            if attempt >= 3 and not notified_admins:
+                # Notify admins after 3 failed attempts
+                try:
+                    for admin_id in ADMINS:
+                        try:
+                            await bot.send_message(admin_id, "❗️ Бот не может подключиться к Telegram API после нескольких попыток. Проверьте сервер или интернет.")
+                        except Exception as notify_err:
+                            logger.error(f"Failed to notify admin {admin_id}: {notify_err}")
+                    notified_admins = True
+                except Exception as notify_outer:
+                    logger.error(f"Failed to notify admins: {notify_outer}")
+            if attempt >= max_retries:
+                logger.critical(f"Max retries ({max_retries}) reached. Stopping bot.")
+                break
+            await asyncio.sleep(delay)
+        except Exception as e:
+            logger.exception(f"Unexpected error in polling: {e}")
+            break
+    await bot.session.close()
+    logger.info("Bot stopped.")
 
 if __name__ == "__main__":
     try:
