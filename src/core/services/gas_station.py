@@ -4,7 +4,7 @@
 from tronpy import Tron
 import time
 from src.core.database.db_service import get_seller_wallet, create_seller_wallet
-from tronpy.keys import HDPrivateKey
+from bip_utils import Bip44, Bip44Coins, Bip44Changes, Bip39SeedGenerator
 
 # Приватный ключ газового кошелька (замените на реальный способ хранения)
 GAS_WALLET_PRIVATE_KEY = "YOUR_GAS_WALLET_PRIVATE_KEY"
@@ -123,17 +123,29 @@ def get_or_create_tron_deposit_address(
     if account is None:
         account = seller_id  # or another unique per-seller value
 
-    # Use xpub if provided, else derive from gas station private key
+
+    # Use xpub if provided, else derive from gas station mnemonic/seed (for admin/gas wallet)
     if xpub:
-        hdkey = HDPrivateKey.from_xpub(xpub)
+        # Derive address from xpub using bip_utils
+        pub_ctx = Bip44.FromExtendedKey(xpub, Bip44Coins.TRON)
+        # Always use external chain (0), address index 0 for deposit
+        address = pub_ctx.Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
+        path = f"m/44'/195'/{account}'/0/0"
     else:
-        from .gas_station import GAS_WALLET_PRIVATE_KEY
-
-        hdkey = HDPrivateKey.from_private(GAS_WALLET_PRIVATE_KEY)
-
-    path = f"m/44'/195'/{account}'/0/0"
-    child = hdkey.derive_path(path)
-    address = child.public_key.to_base58check_address()
+        # For admin/gas wallet, you must have a mnemonic or xprv, not just a private key
+        # Example: use a mnemonic from env/config (replace with your secure storage)
+        import os
+        mnemonic = os.getenv("GAS_WALLET_MNEMONIC", "")
+        if not mnemonic:
+            raise Exception("GAS_WALLET_MNEMONIC not set in environment!")
+        seed_bytes = Bip39SeedGenerator(mnemonic).Generate()
+        bip44_ctx = Bip44.FromSeed(seed_bytes, Bip44Coins.TRON)
+        account_ctx = bip44_ctx.Purpose().Coin().Account(account)
+        # Get xpub for storage if needed
+        xpub = account_ctx.PublicKey().ToExtended()
+        # Derive address for deposit
+        address = account_ctx.Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
+        path = f"m/44'/195'/{account}'/0/0"
 
     # 3. Save to DB
     create_seller_wallet(
