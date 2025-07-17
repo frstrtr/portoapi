@@ -13,7 +13,7 @@ def is_valid_xpub(xpub: str) -> bool:
         # Try to create a Bip44 context from the xpub for Tron
         Bip44.FromExtendedKey(xpub, Bip44Coins.TRON)
         return True
-    except (ValueError, Base58ChecksumError) as e:
+    except (ValueError, Base58ChecksumError):
         # print(f"Validation error: {e}")
         # If any ValueError or Base58ChecksumError occurs during parsing, the xpub is invalid
         return False
