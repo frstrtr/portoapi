@@ -381,12 +381,12 @@ async def process_invoice_group(message: types.Message, state: FSMContext):
         return
     db = message.bot.db
 
-    wallet = get_wallet_by_group(db, telegram_id, invoices_group)
-    if wallet is None:
+    # Always use master wallet (first wallet for seller) and derive address using buyer group as account index
+    wallets = get_wallets_by_seller(db, telegram_id)
+    if not wallets:
         logger.error(
-            f"User {telegram_id} tried to create invoice but has no wallet/xpub for group {invoices_group}."
+            f"User {telegram_id} tried to create invoice but has no master wallet/xpub."
         )
-        # Show main actions keyboard including /register
         kb = types.ReplyKeyboardMarkup(
             keyboard=[
                 [types.KeyboardButton(text="/register")],
@@ -400,29 +400,40 @@ async def process_invoice_group(message: types.Message, state: FSMContext):
             resize_keyboard=True,
         )
         await message.answer(
-            "❌ Ошибка: не найден xPub для вашего аккаунта или выбранной группы. Пожалуйста, зарегистрируйте xPub через /register.",
+            "❌ Ошибка: не найден xPub для вашего аккаунта. Пожалуйста, зарегистрируйте xPub через /register.",
             reply_markup=kb,
         )
         await state.clear()
         return
+    wallet = wallets[0]
+    logger.info(f"Using master wallet xPub: {wallet.xpub} for buyer group/account {invoices_group}")
     buyer_group = get_buyer_group(db, telegram_id, buyer_id)
-    # Derive address from xPub and group/account index
-    derived_address = generate_address_from_xpub(wallet.xpub, invoices_group, account=wallet.account)
+    # To avoid address collision, use a unique derivation index for each invoice
+    # Find the max derivation_index for this group and increment
+    from src.core.database.db_service import get_invoices_by_seller
+    existing_invoices = get_invoices_by_seller(db, telegram_id)
+    used_indices = [inv.derivation_index for inv in existing_invoices if inv.buyer_group_id == buyer_group.id]
+    if used_indices:
+        next_index = max(used_indices) + 1
+    else:
+        next_index = invoices_group
+    derived_address = generate_address_from_xpub(wallet.xpub, next_index, account=wallet.account)
     invoice = create_invoice(
         db=db,
         seller_id=telegram_id,
         buyer_group_id=buyer_group.id,
-        derivation_index=invoices_group,
+        derivation_index=next_index,
         address=derived_address,
         amount=float(data["amount"]),
         status="pending",
     )
     logger.info(
-        f"User {telegram_id} created invoice: address={invoice.address}, amount={data['amount']}, group={buyer_id}"
+        f"User {telegram_id} created invoice: address={invoice.address}, amount={data['amount']}, group={buyer_id}, derivation_index={next_index}"
     )
     await message.answer(
         f"Инвойс создан! Адрес: {invoice.address}\nСумма: {data['amount']}\nОписание: {data['description']}\nГруппа: {buyer_id}"
     )
+    await show_main_menu(message, state)
     await state.clear()
 
 
@@ -485,6 +496,7 @@ async def process_add_buyer_group(message: types.Message, state: FSMContext):
     await message.answer(
         f"Группа для покупателя {buyer_id} с номером {invoices_group} добавлена."
     )
+    await show_main_menu(message, state)
     await state.clear()
 
 
@@ -602,7 +614,11 @@ async def process_register_account(message: types.Message, state: FSMContext):
     # If not needed, the user can reply 'нет' and the bot will use the default derived address.
     # ---
     await message.answer(
-        f"Аккаунт BIP44 {account} успешно сохранён для xPub! Теперь укажите адрес для этого аккаунта (или напишите 'нет', если не требуется):\n\n"
+        f"Аккаунт BIP44 {account} успешно сохранён для xPub!"
+    )
+    await show_main_menu(message, state)
+    await message.answer(
+        "Теперь укажите адрес для этого аккаунта (или напишите 'нет', если не требуется):\n\n"
         "Адрес — это публичный адрес для получения средств, который будет связан с этим аккаунтом. Если не требуется, напишите 'нет'."
     )
     await state.set_state(RegisterFSM.ask_address)
