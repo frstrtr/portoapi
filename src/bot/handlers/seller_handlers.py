@@ -32,13 +32,16 @@ from src.core.services.gas_station import (
 )
 
 
-logger = logging.getLogger("bot.seller_handlers")
-
 # pylint: disable=logging-fstring-interpolation
 
 
 # Import admin handlers
 from src.bot.admin.admin_handlers import handle_admin_xpubs, is_admin
+
+# Import database service functions
+from src.core.database.db_service import get_wallets_by_seller
+
+logger = logging.getLogger("bot.seller_handlers")
 
 
 # FSM для создания инвойса с выбором группы
@@ -60,17 +63,131 @@ class RegisterFSM(StatesGroup):
     ask_xpub = State()
     get_xpub = State()
     get_account = State()
+    choose_account_action = State()
+    select_existing_account = State()
 
 
 async def handle_register(message: types.Message, state: FSMContext = None):
-    # Register admin command handler (should be in main_bot.py, but for demo, add here)
-    if message.text and message.text.startswith("/admin_xpubs"):
-        await handle_admin_xpubs(message)
+    # Only handle /register command here
+    logger.info(f"User {message.from_user.id} called /register")
+
+    if message.text and message.text.strip() != "/register":
         return
     telegram_id = message.from_user.id
     db = message.bot.db
     seller = get_seller(db=db, telegram_id=telegram_id)
 
+    # If seller does not exist, create and prompt for xPub
+    if not seller:
+        create_seller(db=db, telegram_id=telegram_id)
+        await message.answer(
+            "Вы новый пользователь. Пожалуйста, отправьте ваш xPub (или напишите 'нет', чтобы получить инструкцию)."
+        )
+        if state is not None:
+            await state.set_state(RegisterFSM.get_xpub)
+        return
+
+    # Check if seller has any xPub submitted (wallets with seller_id)
+    wallets = get_wallets_by_seller(db, telegram_id)
+    has_xpub = any(w.xpub for w in wallets)
+
+    if not has_xpub:
+        await message.answer(
+            "У вас ещё не зарегистрирован ни один xPub. Пожалуйста, отправьте ваш xPub (или напишите 'нет', чтобы получить инструкцию)."
+        )
+        if state is not None:
+            await state.set_state(RegisterFSM.get_xpub)
+        return
+
+    if wallets:
+        kb = types.ReplyKeyboardMarkup(
+            keyboard=[
+                [types.KeyboardButton(text="Использовать существующий аккаунт")],
+                [types.KeyboardButton(text="Создать новый аккаунт в этом xPub")],
+                [types.KeyboardButton(text="Создать новый кошелек (новый xPub)")],
+            ],
+            resize_keyboard=True,
+        )
+        logger.info(
+            f"User {telegram_id} has wallets, prompting for registration choice."
+        )
+        try:
+            await message.answer(
+                "У вас уже есть зарегистрированные кошельки. Выберите действие:",
+                reply_markup=kb,
+            )
+            await state.set_state(RegisterFSM.choose_account_action)
+            logger.info(
+                f"FSM state set to choose_account_action for user {telegram_id}"
+            )
+        except Exception as e:
+            logger.error(f"Error in registration choice prompt: {e}")
+            await message.answer(
+                "Ошибка при обработке выбора. Попробуйте ещё раз или обратитесь к администратору."
+            )
+        return
+
+
+# --- Registration FSM choice handlers ---
+async def process_choose_account_action(message: types.Message, state: FSMContext):
+    telegram_id = message.from_user.id
+    db = message.bot.db
+    choice = message.text.strip()
+    from src.core.database.db_service import get_wallets_by_seller
+
+    wallets = get_wallets_by_seller(db, telegram_id)
+    if choice == "Использовать существующий аккаунт":
+        # Show list of accounts to choose from
+        kb = types.ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
+        for w in wallets:
+            kb.keyboard.append(
+                [types.KeyboardButton(text=f"xPub: {w.xpub} | Account: {w.account}")]
+            )
+        await message.answer("Выберите аккаунт для использования:", reply_markup=kb)
+        await state.set_state(RegisterFSM.select_existing_account)
+        return
+    elif choice == "Создать новый аккаунт в этом xPub":
+        # Ask for xPub to use (show list)
+        xpubs = list(set([w.xpub for w in wallets]))
+        kb = types.ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
+        for xpub in xpubs:
+            kb.keyboard.append([types.KeyboardButton(text=f"{xpub}")])
+        await message.answer(
+            "Выберите xPub для создания нового аккаунта:", reply_markup=kb
+        )
+        await state.update_data(wallets=wallets)
+        await state.set_state(RegisterFSM.get_xpub)
+        return
+    elif choice == "Создать новый кошелек (новый xPub)":
+        await message.answer("Пожалуйста, отправьте новый xPub:")
+        await state.set_state(RegisterFSM.get_xpub)
+        return
+    else:
+        await message.answer(
+            "Некорректный выбор. Пожалуйста, выберите действие из списка."
+        )
+        return
+
+
+async def process_select_existing_account(message: types.Message, state: FSMContext):
+    telegram_id = message.from_user.id
+    db = message.bot.db
+    account_info = message.text.strip()
+    # Parse xPub and account
+    try:
+        parts = account_info.replace("xPub:", "").replace("Account:", "").split("|")
+        xpub = parts[0].strip()
+        account = int(parts[1].strip())
+    except Exception:
+        await message.answer(
+            "Некорректный формат аккаунта. Пожалуйста, выберите из списка."
+        )
+        return
+    await message.answer(
+        f"Вы выбрали аккаунт {account} для xPub {xpub}. Регистрация пропущена, можно использовать этот аккаунт."
+    )
+    await state.clear()
+    return
     await message.answer(
         "Регистрация нового HD кошелька.\n\n"
         "Пожалуйста, отправьте ваш xPub (или напишите 'нет', чтобы получить инструкцию)."
@@ -372,39 +489,65 @@ async def process_register_xpub(message: types.Message, state: FSMContext):
     text = message.text.strip()
     logger.info(f"User {telegram_id} process_register_xpub: {text}")
     if text.lower() == "нет":
-        await message.answer("Для генерации xPub используйте офлайн-страницу (xpub_offline.html) на вашем компьютере. Сгенерируйте xPub и отправьте его сюда. Никогда не делитесь seed-фразой или приватным ключом!")
+        await message.answer(
+            "Для генерации xPub используйте офлайн-страницу (xpub_offline.html) на вашем компьютере. Сгенерируйте xPub и отправьте его сюда. Никогда не делитесь seed-фразой или приватным ключом!"
+        )
         await state.clear()
         return
     xpub = text
     if not is_valid_xpub(xpub):
         logger.warning(f"User {telegram_id} provided invalid xPub: {xpub}")
-        await message.answer("Некорректный xPub. Пожалуйста, проверьте и отправьте корректный xPub.")
+        await message.answer(
+            "Некорректный xPub. Пожалуйста, проверьте и отправьте корректный xPub."
+        )
         return
     await state.update_data(xpub=xpub)
-    await message.answer("Теперь укажите номер аккаунта (BIP44 account, например 0, 1, 2...) для этого xPub:")
-    await state.set_state(RegisterFSM.get_account)
+    db = message.bot.db
+    # Find max account for this xpub and seller
+    from src.core.database.db_service import get_wallets_by_seller
+
+    wallets = get_wallets_by_seller(db, telegram_id)
+    same_xpub_wallets = [w for w in wallets if w.xpub == xpub]
+    if same_xpub_wallets:
+        next_account = (
+            max(
+                [w.account for w in same_xpub_wallets if w.account is not None],
+                default=-1,
+            )
+            + 1
+        )
+    else:
+        next_account = 0
+    await state.update_data(account=next_account)
+    await message.answer(
+        f"Аккаунт BIP44 для этого xPub будет автоматически назначен: {next_account}. Продолжаем регистрацию..."
+    )
+    await process_register_account(message, state, auto=True)
+
+
 async def process_register_account(message: types.Message, state: FSMContext):
     telegram_id = message.from_user.id
-    account_text = message.text.strip()
-    logger.info(f"User {telegram_id} process_register_account: {account_text}")
-    try:
-        account = int(account_text)
-    except Exception:
-        await message.answer("Некорректный номер аккаунта. Введите целое число.")
-        return
+    # If called from auto mode, get account from state
     data = await state.get_data()
     xpub = data.get("xpub")
     db = message.bot.db
+    account = data.get("account")
     from src.core.database.db_service import get_wallet_by_group, create_seller_wallet
+
     wallet = get_wallet_by_group(db, telegram_id, account)
     if wallet and wallet.xpub == xpub:
-        await message.answer("Этот xPub уже зарегистрирован для выбранного аккаунта. Регистрация пропущена.")
+        await message.answer(
+            f"Этот xPub уже зарегистрирован для аккаунта {account}. Регистрация пропущена."
+        )
         await state.clear()
         return
     if wallet:
         wallet.xpub = xpub
+        wallet.account = account
         db.commit()
-        logger.info(f"User {telegram_id} xPub updated in wallet: {xpub} (account {account})")
+        logger.info(
+            f"User {telegram_id} xPub updated in wallet: {xpub} (account {account})"
+        )
     else:
         create_seller_wallet(
             db,
@@ -413,25 +556,34 @@ async def process_register_account(message: types.Message, state: FSMContext):
             account=account,
             address=None,
             derivation_path=None,
-            deposit_type=None
+            deposit_type=None,
         )
-        logger.info(f"User {telegram_id} registered new xPub and wallet created: {xpub} (account {account})")
-    kb = types.ReplyKeyboardMarkup(
-        keyboard=[
-            [types.KeyboardButton(text="/deposit")],
-            [types.KeyboardButton(text="/balance")],
-            [types.KeyboardButton(text="/create_invoice")],
-            [types.KeyboardButton(text="/buyers")],
-            [types.KeyboardButton(text="/add_buyer")],
-            [types.KeyboardButton(text="/sweep")],
-        ],
-        resize_keyboard=True,
+        logger.info(
+            f"User {telegram_id} registered new xPub and wallet created: {xpub} (account {account})"
+        )
+    await state.update_data(account=account)
+    await message.answer(
+        f"Аккаунт BIP44 {account} успешно сохранён для xPub! Теперь укажите адрес для этого аккаунта (или напишите 'нет', если не требуется):"
     )
-    await message.answer("Ваш xPub и аккаунт успешно зарегистрированы/обновлены!\nВыберите действие:", reply_markup=kb)
-    await state.clear()
+    await state.set_state(RegisterFSM.ask_address)
+
+
 def register_registration_fsm_handlers(dp, seller_handlers):
-    dp.message.register(seller_handlers.process_register_xpub, seller_handlers.RegisterFSM.get_xpub)
-    dp.message.register(seller_handlers.process_register_account, seller_handlers.RegisterFSM.get_account)
+    dp.message.register(
+        seller_handlers.process_choose_account_action,
+        seller_handlers.RegisterFSM.choose_account_action,
+    )
+    dp.message.register(
+        seller_handlers.process_select_existing_account,
+        seller_handlers.RegisterFSM.select_existing_account,
+    )
+    dp.message.register(
+        seller_handlers.process_register_xpub, seller_handlers.RegisterFSM.get_xpub
+    )
+    dp.message.register(
+        seller_handlers.process_register_account,
+        seller_handlers.RegisterFSM.get_account,
+    )
 
 
 # # --- Admin command: /admin_xpubs <seller_id> ---
