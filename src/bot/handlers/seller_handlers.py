@@ -408,30 +408,51 @@ async def process_invoice_group(message: types.Message, state: FSMContext):
     wallet = wallets[0]
     logger.info(f"Using master wallet xPub: {wallet.xpub} for buyer group/account {invoices_group}")
     buyer_group = get_buyer_group(db, telegram_id, buyer_id)
-    # To avoid address collision, use a unique derivation index for each invoice
-    # Find the max derivation_index for this group and increment
+    # Always use buyer group as account index, and use a unique derivation index for each invoice (address index)
     from src.core.database.db_service import get_invoices_by_seller
     existing_invoices = get_invoices_by_seller(db, telegram_id)
-    used_indices = [inv.derivation_index for inv in existing_invoices if inv.buyer_group_id == buyer_group.id]
-    if used_indices:
-        next_index = max(used_indices) + 1
-    else:
-        next_index = invoices_group
-    derived_address = generate_address_from_xpub(wallet.xpub, next_index, account=wallet.account)
+    # Only consider used addresses for this xpub and this account index (buyer group)
+    used_addresses = set(
+        inv.address for inv in existing_invoices
+        if inv.derivation_index is not None and getattr(inv, "buyer_group_id", None) == buyer_group.id
+    )
+    # Find the first unused address index for this account (buyer group)
+    next_address_index = 0
+    while True:
+        candidate_address = generate_address_from_xpub(wallet.xpub, next_address_index, account=invoices_group)
+        if candidate_address not in used_addresses:
+            derived_address = candidate_address
+            break
+        next_address_index += 1
+    # Log full derivation path
+    derivation_path = f"m/44'/195'/{invoices_group}'/0/{next_address_index}"
     invoice = create_invoice(
         db=db,
         seller_id=telegram_id,
         buyer_group_id=buyer_group.id,
-        derivation_index=next_index,
+        derivation_index=next_address_index,
         address=derived_address,
         amount=float(data["amount"]),
         status="pending",
     )
     logger.info(
-        f"User {telegram_id} created invoice: address={invoice.address}, amount={data['amount']}, group={buyer_id}, derivation_index={next_index}"
+        f"User {telegram_id} created invoice: address={invoice.address}, amount={data['amount']}, group={buyer_id}, derivation_index={next_address_index}, derivation_path={derivation_path}"
     )
+    # Generate QR code for invoice address
+    qr = qrcode.QRCode(box_size=6, border=2)
+    qr.add_data(invoice.address)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
     await message.answer(
-        f"Инвойс создан! Адрес: {invoice.address}\nСумма: {data['amount']}\nОписание: {data['description']}\nГруппа: {buyer_id}"
+        f"Инвойс создан!\nАдрес: <code>{invoice.address}</code>\nСумма: <b>{data['amount']}</b>\nОписание: {data['description']}\nГруппа: {buyer_id}\n\nПуть деривации: <code>{derivation_path}</code>",
+        parse_mode="HTML",
+    )
+    await message.answer_photo(
+        BufferedInputFile(buf.getvalue(), "invoice_qr.png"),
+        caption=f"QR-код для инвойса: {invoice.address}",
     )
     await show_main_menu(message, state)
     await state.clear()
