@@ -162,14 +162,14 @@ def get_wallet(db, wallet_id):
 
 
 def get_wallets_by_seller(db, telegram_id):
-    return db.query(Wallet).filter(Wallet.telegram_id == telegram_id).all()
+    return db.query(Wallet).filter(Wallet.seller_id == telegram_id).all()
 
 
 def get_wallet_by_group(db, telegram_id, invoices_group):
     return (
         db.query(Wallet)
         .filter(
-            Wallet.telegram_id == telegram_id, Wallet.invoices_group == invoices_group
+            Wallet.seller_id == telegram_id, Wallet.account == invoices_group
         )
         .first()
     )

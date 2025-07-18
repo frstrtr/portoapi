@@ -123,6 +123,14 @@ async def main():
         lambda m: m.text == "/register",
     )
     dp.message.register(
+        log_and_handle(seller_handlers.process_choose_account_action, "register_choose_account_action"),
+        seller_handlers.RegisterFSM.choose_account_action,
+    )
+    dp.message.register(
+        log_and_handle(seller_handlers.process_select_existing_account, "register_select_existing_account"),
+        seller_handlers.RegisterFSM.select_existing_account,
+    )
+    dp.message.register(
         log_and_handle(seller_handlers.process_register_xpub, "register_xpub_ask"),
         seller_handlers.RegisterFSM.ask_xpub,
     )
