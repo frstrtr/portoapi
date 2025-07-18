@@ -36,10 +36,14 @@ from src.core.services.gas_station import (
 
 
 # Import admin handlers
+# admin handler will show xPubs for admin users
 from src.bot.admin.admin_handlers import handle_admin_xpubs, is_admin
 
 # Import database service functions
 from src.core.database.db_service import get_wallets_by_seller
+
+from src.core.crypto.hd_wallet_service import generate_address_from_xpub
+
 
 logger = logging.getLogger("bot.seller_handlers")
 
@@ -65,6 +69,7 @@ class RegisterFSM(StatesGroup):
     get_account = State()
     choose_account_action = State()
     select_existing_account = State()
+    ask_address = State()
 
 
 async def handle_register(message: types.Message, state: FSMContext = None):
@@ -140,8 +145,13 @@ async def process_choose_account_action(message: types.Message, state: FSMContex
         # Show list of accounts to choose from
         kb = types.ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
         for w in wallets:
+            short_xpub = f"...{w.xpub[-8:]}" if w.xpub else "(нет xPub)"
             kb.keyboard.append(
-                [types.KeyboardButton(text=f"xPub: {w.xpub} | Account: {w.account}")]
+                [
+                    types.KeyboardButton(
+                        text=f"xPub: {short_xpub} | Account: {w.account}"
+                    )
+                ]
             )
         await message.answer("Выберите аккаунт для использования:", reply_markup=kb)
         await state.set_state(RegisterFSM.select_existing_account)
@@ -186,8 +196,28 @@ async def process_select_existing_account(message: types.Message, state: FSMCont
     await message.answer(
         f"Вы выбрали аккаунт {account} для xPub {xpub}. Регистрация пропущена, можно использовать этот аккаунт."
     )
+    await show_main_menu(message, state)
     await state.clear()
     return
+
+
+async def show_main_menu(message: types.Message, state: FSMContext = None):
+    """
+    Show the main actions keyboard to the user.
+    """
+    kb = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="/register")],
+            [types.KeyboardButton(text="/deposit")],
+            [types.KeyboardButton(text="/balance")],
+            [types.KeyboardButton(text="/create_invoice")],
+            [types.KeyboardButton(text="/buyers")],
+            [types.KeyboardButton(text="/add_buyer")],
+            [types.KeyboardButton(text="/sweep")],
+        ],
+        resize_keyboard=True,
+    )
+    await message.answer("Вы вернулись в главное меню.", reply_markup=kb)
     await message.answer(
         "Регистрация нового HD кошелька.\n\n"
         "Пожалуйста, отправьте ваш xPub (или напишите 'нет', чтобы получить инструкцию)."
@@ -196,20 +226,20 @@ async def process_select_existing_account(message: types.Message, state: FSMCont
         await state.set_state(RegisterFSM.get_xpub)
     return
 
-    # Non-FSM registration flow
-    token = secrets.token_urlsafe(16)
-    seller = get_seller(db=db, telegram_id=telegram_id)
-    if not seller:
-        create_seller(db=db, telegram_id=telegram_id)
-        msg = "Ваша ссылка для настройки кошелька:"
-    else:
-        msg = "Вы уже зарегистрированы. Ваша ссылка для настройки кошелька:"
-    import os
+    # # Non-FSM registration flow
+    # token = secrets.token_urlsafe(16)
+    # seller = get_seller(db=db, telegram_id=telegram_id)
+    # if not seller:
+    #     create_seller(db=db, telegram_id=telegram_id)
+    #     msg = "Ваша ссылка для настройки кошелька:"
+    # else:
+    #     msg = "Вы уже зарегистрированы. Ваша ссылка для настройки кошелька:"
+    # import os
 
-    base_url = os.getenv("SETUP_URL_BASE", "https://127.0.0.1:8000")
-    url = f"{base_url}/setup.html?token={token}"
-    logger.info(f"User {telegram_id} setup link: {url}")
-    await message.answer(f"{msg} {url}")
+    # base_url = os.getenv("SETUP_URL_BASE", "https://127.0.0.1:8000")
+    # url = f"{base_url}/setup.html?token={token}"
+    # logger.info(f"User {telegram_id} setup link: {url}")
+    # await message.answer(f"{msg} {url}")
 
 
 async def handle_deposit(message: types.Message):
@@ -376,12 +406,14 @@ async def process_invoice_group(message: types.Message, state: FSMContext):
         await state.clear()
         return
     buyer_group = get_buyer_group(db, telegram_id, buyer_id)
+    # Derive address from xPub and group/account index
+    derived_address = generate_address_from_xpub(wallet.xpub, invoices_group, account=wallet.account)
     invoice = create_invoice(
         db=db,
         seller_id=telegram_id,
         buyer_group_id=buyer_group.id,
-        derivation_index=0,
-        address=wallet.xpub,
+        derivation_index=invoices_group,
+        address=derived_address,
         amount=float(data["amount"]),
         status="pending",
     )
@@ -522,7 +554,7 @@ async def process_register_xpub(message: types.Message, state: FSMContext):
     await message.answer(
         f"Аккаунт BIP44 для этого xPub будет автоматически назначен: {next_account}. Продолжаем регистрацию..."
     )
-    await process_register_account(message, state, auto=True)
+    await process_register_account(message, state)
 
 
 async def process_register_account(message: types.Message, state: FSMContext):
@@ -562,8 +594,16 @@ async def process_register_account(message: types.Message, state: FSMContext):
             f"User {telegram_id} registered new xPub and wallet created: {xpub} (account {account})"
         )
     await state.update_data(account=account)
+    # ---
+    # The following prompt asks the user to provide a public receiving address for the registered account.
+    # By default, the bot will derive this address from the xPub and BIP44 account index.
+    # However, the user can override it by specifying a custom address (for advanced integrations, external wallets, or business needs).
+    # The public address is safe to share and is used to receive funds for this account.
+    # If not needed, the user can reply 'нет' and the bot will use the default derived address.
+    # ---
     await message.answer(
-        f"Аккаунт BIP44 {account} успешно сохранён для xPub! Теперь укажите адрес для этого аккаунта (или напишите 'нет', если не требуется):"
+        f"Аккаунт BIP44 {account} успешно сохранён для xPub! Теперь укажите адрес для этого аккаунта (или напишите 'нет', если не требуется):\n\n"
+        "Адрес — это публичный адрес для получения средств, который будет связан с этим аккаунтом. Если не требуется, напишите 'нет'."
     )
     await state.set_state(RegisterFSM.ask_address)
 
