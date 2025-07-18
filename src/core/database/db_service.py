@@ -1,29 +1,52 @@
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from .models import Seller, Invoice, Transaction, Wallet, GasStation
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../'))  # points to project root
+DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'data', 'database.sqlite3')}"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+logger.info(f"Full DATABASE_URL: {DATABASE_URL}")
+DB_PATH = DATABASE_URL.replace("sqlite:///", "")
+logger.info(f"Resolved DB_PATH: {DB_PATH}")
+
+
 # --- BUYER GROUPS CRUD ---
 def get_buyer_groups_by_seller(db, seller_id):
     from .models import BuyerGroup
+
     return db.query(BuyerGroup).filter(BuyerGroup.seller_id == seller_id).all()
+
 
 def get_buyer_group(db, seller_id, buyer_id):
     from .models import BuyerGroup
-    return db.query(BuyerGroup).filter(BuyerGroup.seller_id == seller_id, BuyerGroup.buyer_id == buyer_id).first()
+
+    return (
+        db.query(BuyerGroup)
+        .filter(BuyerGroup.seller_id == seller_id, BuyerGroup.buyer_id == buyer_id)
+        .first()
+    )
+
 
 def create_buyer_group(db, seller_id, buyer_id, invoices_group, xpub=None):
     from .models import BuyerGroup
-    group = BuyerGroup(seller_id=seller_id, buyer_id=buyer_id, invoices_group=invoices_group, xpub=xpub)
+
+    group = BuyerGroup(
+        seller_id=seller_id, buyer_id=buyer_id, invoices_group=invoices_group, xpub=xpub
+    )
     db.add(group)
     db.commit()
     db.refresh(group)
     return group
+
+
 # Функции для работы с базой данных
 
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from .models import Seller, Invoice, Transaction, Wallet, GasStation
-
-DATABASE_URL = 'sqlite:///./database.sqlite3'
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def get_db():
     db = SessionLocal()
@@ -31,6 +54,7 @@ def get_db():
         yield db
     finally:
         db.close()
+
 
 # --- SELLERS CRUD ---
 def create_seller(db, telegram_id, **kwargs):
@@ -40,8 +64,10 @@ def create_seller(db, telegram_id, **kwargs):
     db.refresh(seller)
     return seller
 
+
 def get_seller(db, telegram_id):
     return db.query(Seller).filter(Seller.telegram_id == telegram_id).first()
+
 
 def update_seller(db, telegram_id, **kwargs):
     seller = get_seller(db, telegram_id)
@@ -51,10 +77,12 @@ def update_seller(db, telegram_id, **kwargs):
     db.refresh(seller)
     return seller
 
+
 def delete_seller(db, telegram_id):
     seller = get_seller(db, telegram_id)
     db.delete(seller)
     db.commit()
+
 
 # --- INVOICES CRUD ---
 def create_invoice(db, **kwargs):
@@ -64,11 +92,14 @@ def create_invoice(db, **kwargs):
     db.refresh(invoice)
     return invoice
 
+
 def get_invoice(db, invoice_id):
     return db.query(Invoice).filter(Invoice.id == invoice_id).first()
 
+
 def get_invoices_by_seller(db, seller_id):
     return db.query(Invoice).filter(Invoice.seller_id == seller_id).all()
+
 
 def update_invoice(db, invoice_id, **kwargs):
     invoice = get_invoice(db, invoice_id)
@@ -78,10 +109,12 @@ def update_invoice(db, invoice_id, **kwargs):
     db.refresh(invoice)
     return invoice
 
+
 def delete_invoice(db, invoice_id):
     invoice = get_invoice(db, invoice_id)
     db.delete(invoice)
     db.commit()
+
 
 # --- TRANSACTIONS CRUD ---
 def create_transaction(db, **kwargs):
@@ -91,11 +124,14 @@ def create_transaction(db, **kwargs):
     db.refresh(tx)
     return tx
 
+
 def get_transaction(db, tx_id):
     return db.query(Transaction).filter(Transaction.id == tx_id).first()
 
+
 def get_transactions_by_invoice(db, invoice_id):
     return db.query(Transaction).filter(Transaction.invoice_id == invoice_id).all()
+
 
 def update_transaction(db, tx_id, **kwargs):
     tx = get_transaction(db, tx_id)
@@ -105,10 +141,12 @@ def update_transaction(db, tx_id, **kwargs):
     db.refresh(tx)
     return tx
 
+
 def delete_transaction(db, tx_id):
     tx = get_transaction(db, tx_id)
     db.delete(tx)
     db.commit()
+
 
 # --- WALLETS CRUD ---
 def create_wallet(db, **kwargs):
@@ -118,14 +156,24 @@ def create_wallet(db, **kwargs):
     db.refresh(wallet)
     return wallet
 
+
 def get_wallet(db, wallet_id):
     return db.query(Wallet).filter(Wallet.id == wallet_id).first()
+
 
 def get_wallets_by_seller(db, telegram_id):
     return db.query(Wallet).filter(Wallet.telegram_id == telegram_id).all()
 
+
 def get_wallet_by_group(db, telegram_id, invoices_group):
-    return db.query(Wallet).filter(Wallet.telegram_id == telegram_id, Wallet.invoices_group == invoices_group).first()
+    return (
+        db.query(Wallet)
+        .filter(
+            Wallet.telegram_id == telegram_id, Wallet.invoices_group == invoices_group
+        )
+        .first()
+    )
+
 
 def update_wallet(db, wallet_id, **kwargs):
     wallet = get_wallet(db, wallet_id)
@@ -135,15 +183,24 @@ def update_wallet(db, wallet_id, **kwargs):
     db.refresh(wallet)
     return wallet
 
+
 def delete_wallet(db, wallet_id):
     wallet = get_wallet(db, wallet_id)
     db.delete(wallet)
     db.commit()
 
-def get_seller_wallet(db, seller_id, deposit_type):
-    return db.query(Wallet).filter_by(seller_id=seller_id, deposit_type=deposit_type).first()
 
-def create_seller_wallet(db, seller_id, address, derivation_path, deposit_type, xpub, account):
+def get_seller_wallet(db, seller_id, deposit_type):
+    return (
+        db.query(Wallet)
+        .filter_by(seller_id=seller_id, deposit_type=deposit_type)
+        .first()
+    )
+
+
+def create_seller_wallet(
+    db, seller_id, address, derivation_path, deposit_type, xpub, account
+):
     wallet = Wallet(
         seller_id=seller_id,
         address=address,
@@ -157,6 +214,7 @@ def create_seller_wallet(db, seller_id, address, derivation_path, deposit_type, 
     db.refresh(wallet)
     return wallet
 
+
 # --- GAS STATION CRUD ---
 def create_gas_station(db, **kwargs):
     gs = GasStation(**kwargs)
@@ -165,11 +223,14 @@ def create_gas_station(db, **kwargs):
     db.refresh(gs)
     return gs
 
+
 def get_gas_station(db, gs_id):
     return db.query(GasStation).filter(GasStation.id == gs_id).first()
 
+
 def get_gas_station_by_seller(db, telegram_id):
     return db.query(GasStation).filter(GasStation.telegram_id == telegram_id).first()
+
 
 def update_gas_station(db, gs_id, **kwargs):
     gs = get_gas_station(db, gs_id)
@@ -178,6 +239,7 @@ def update_gas_station(db, gs_id, **kwargs):
     db.commit()
     db.refresh(gs)
     return gs
+
 
 def delete_gas_station(db, gs_id):
     gs = get_gas_station(db, gs_id)
