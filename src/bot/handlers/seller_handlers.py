@@ -59,6 +59,7 @@ class AddBuyerFSM(StatesGroup):
 class RegisterFSM(StatesGroup):
     ask_xpub = State()
     get_xpub = State()
+    get_account = State()
 
 
 async def handle_register(message: types.Message, state: FSMContext = None):
@@ -70,18 +71,13 @@ async def handle_register(message: types.Message, state: FSMContext = None):
     db = message.bot.db
     seller = get_seller(db=db, telegram_id=telegram_id)
 
-    if seller and hasattr(seller, "xpub") and seller.xpub:
-        await message.answer("Вы уже зарегистрированы. Ваш xPub сохранён.")
-        return
-
+    await message.answer(
+        "Регистрация нового HD кошелька.\n\n"
+        "Пожалуйста, отправьте ваш xPub (или напишите 'нет', чтобы получить инструкцию)."
+    )
     if state is not None:
-        await message.answer(
-            "У вас уже есть xPub ключ?\n\n"
-            "Если да — отправьте его сюда.\n"
-            "Если нет — напишите 'нет', и я дам вам инструкцию, как его создать безопасно."
-        )
-        await state.set_state(RegisterFSM.ask_xpub)
-        return
+        await state.set_state(RegisterFSM.get_xpub)
+    return
 
     # Non-FSM registration flow
     token = secrets.token_urlsafe(16)
@@ -371,74 +367,71 @@ async def handle_sweep(message: types.Message):
     await message.answer("Все оплаченные инвойсы обработаны и выведены.")
 
 
-# async def handle_register(message: types.Message, state: FSMContext):
-#     """Регистрация продавца через FSM."""
-#     telegram_id = message.from_user.id
-#     logger.info(f"User {telegram_id} called /register (FSM)")
-#     await message.answer(
-#         "У вас уже есть xPub ключ?\n\n"
-#         "Если да — отправьте его сюда.\n"
-#         "Если нет — напишите 'нет', и я дам вам инструкцию, как его создать безопасно."
-#     )
-#     await state.set_state(RegisterFSM.ask_xpub)
-
-
 async def process_register_xpub(message: types.Message, state: FSMContext):
     telegram_id = message.from_user.id
     text = message.text.strip()
     logger.info(f"User {telegram_id} process_register_xpub: {text}")
     if text.lower() == "нет":
-        await message.answer(
-            "Для генерации xPub используйте офлайн-страницу (xpub_offline.html) на вашем компьютере. "
-            "Сгенерируйте xPub и отправьте его сюда. "
-            "Никогда не делитесь seed-фразой или приватным ключом!"
-        )
-        await state.set_state(RegisterFSM.get_xpub)
-    else:
-        xpub = text
-        # Валидация xPub
-        if not is_valid_xpub(xpub):
-            logger.warning(f"User {telegram_id} provided invalid xPub: {xpub}")
-            await message.answer(
-                "Некорректный xPub. Пожалуйста, проверьте и отправьте корректный xPub."
-            )
-            return
-        db = message.bot.db
-        seller = get_seller(db, telegram_id)
-        if seller:
-            update_seller(db, telegram_id, xpub=xpub)
-        else:
-            create_seller(db, telegram_id, xpub=xpub)
-        # Create Wallet for default group (0) if not exists
-        wallet = get_wallet_by_group(db, telegram_id, 0)
-        if not wallet:
-            create_seller_wallet(
-                db,
-                seller_id=telegram_id,
-                address=None,
-                derivation_path=None,
-                deposit_type=None,
-                xpub=xpub,
-                account=0,
-            )
-        logger.info(f"User {telegram_id} xPub saved and wallet created: {xpub}")
-        # Клавиатура с основными действиями продавца
-        kb = types.ReplyKeyboardMarkup(
-            keyboard=[
-                [types.KeyboardButton(text="/deposit")],
-                [types.KeyboardButton(text="/balance")],
-                [types.KeyboardButton(text="/create_invoice")],
-                [types.KeyboardButton(text="/buyers")],
-                [types.KeyboardButton(text="/add_buyer")],
-                [types.KeyboardButton(text="/sweep")],
-            ],
-            resize_keyboard=True,
-        )
-        await message.answer(
-            "Ваш xPub сохранён. Регистрация завершена!\nВыберите действие:",
-            reply_markup=kb,
-        )
+        await message.answer("Для генерации xPub используйте офлайн-страницу (xpub_offline.html) на вашем компьютере. Сгенерируйте xPub и отправьте его сюда. Никогда не делитесь seed-фразой или приватным ключом!")
         await state.clear()
+        return
+    xpub = text
+    if not is_valid_xpub(xpub):
+        logger.warning(f"User {telegram_id} provided invalid xPub: {xpub}")
+        await message.answer("Некорректный xPub. Пожалуйста, проверьте и отправьте корректный xPub.")
+        return
+    await state.update_data(xpub=xpub)
+    await message.answer("Теперь укажите номер аккаунта (BIP44 account, например 0, 1, 2...) для этого xPub:")
+    await state.set_state(RegisterFSM.get_account)
+async def process_register_account(message: types.Message, state: FSMContext):
+    telegram_id = message.from_user.id
+    account_text = message.text.strip()
+    logger.info(f"User {telegram_id} process_register_account: {account_text}")
+    try:
+        account = int(account_text)
+    except Exception:
+        await message.answer("Некорректный номер аккаунта. Введите целое число.")
+        return
+    data = await state.get_data()
+    xpub = data.get("xpub")
+    db = message.bot.db
+    from src.core.database.db_service import get_wallet_by_group, create_seller_wallet
+    wallet = get_wallet_by_group(db, telegram_id, account)
+    if wallet and wallet.xpub == xpub:
+        await message.answer("Этот xPub уже зарегистрирован для выбранного аккаунта. Регистрация пропущена.")
+        await state.clear()
+        return
+    if wallet:
+        wallet.xpub = xpub
+        db.commit()
+        logger.info(f"User {telegram_id} xPub updated in wallet: {xpub} (account {account})")
+    else:
+        create_seller_wallet(
+            db,
+            seller_id=telegram_id,
+            xpub=xpub,
+            account=account,
+            address=None,
+            derivation_path=None,
+            deposit_type=None
+        )
+        logger.info(f"User {telegram_id} registered new xPub and wallet created: {xpub} (account {account})")
+    kb = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="/deposit")],
+            [types.KeyboardButton(text="/balance")],
+            [types.KeyboardButton(text="/create_invoice")],
+            [types.KeyboardButton(text="/buyers")],
+            [types.KeyboardButton(text="/add_buyer")],
+            [types.KeyboardButton(text="/sweep")],
+        ],
+        resize_keyboard=True,
+    )
+    await message.answer("Ваш xPub и аккаунт успешно зарегистрированы/обновлены!\nВыберите действие:", reply_markup=kb)
+    await state.clear()
+def register_registration_fsm_handlers(dp, seller_handlers):
+    dp.message.register(seller_handlers.process_register_xpub, seller_handlers.RegisterFSM.get_xpub)
+    dp.message.register(seller_handlers.process_register_account, seller_handlers.RegisterFSM.get_account)
 
 
 # # --- Admin command: /admin_xpubs <seller_id> ---

@@ -96,15 +96,19 @@ class GasStation(Base):
 class Wallet(Base):
     __tablename__ = "wallets"
     id = Column(Integer, primary_key=True)
-    telegram_id = Column(Integer, ForeignKey("sellers.telegram_id"))
-    buyer_group_id = Column(Integer, ForeignKey("buyer_groups.id"), nullable=True)
-    invoices_group = Column(Integer, nullable=False, default=0)  # BIP44 account (group)
+    seller_id = Column(Integer, ForeignKey("sellers.telegram_id"))
     xpub = Column(Text, nullable=False)
-    derivation_path = Column(Text, nullable=True)  # New: store derivation path
-    deposit_type = Column(String(16), nullable=True)  # New: TRX/USDT etc
-    account = Column(Integer, nullable=True)  # New: account in derivation path
+    account = Column(Integer, nullable=False, default=0)  # BIP44 account (group)
+    label = Column(String(64), nullable=True)  # Optional: wallet label/name
+    address = Column(Text, nullable=True)  # Main address for this wallet/account
+    derivation_path = Column(Text, nullable=True)
+    deposit_type = Column(String(16), nullable=True)
+    buyer_group_id = Column(Integer, ForeignKey("buyer_groups.id"), nullable=True)
     seller = relationship("Seller", back_populates="wallets")
     buyer_group = relationship("BuyerGroup")
     balances = relationship("Balance", back_populates="wallet")
     porto_token_balance = Column(Float, default=0)
     USDT_tron_balance = Column(Float, default=0)
+    __table_args__ = (
+        UniqueConstraint("seller_id", "xpub", "account", name="uix_seller_xpub_account"),
+    )
