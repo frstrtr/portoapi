@@ -63,7 +63,7 @@ class Invoice(Base):
     seller_id = Column(Integer, ForeignKey("sellers.telegram_id"))
     buyer_group_id = Column(Integer, ForeignKey("buyer_groups.id"))
     derivation_index = Column(Integer, nullable=False)
-    address = Column(Text, unique=True, nullable=False)
+    address = Column(Text, nullable=False)
     amount = Column(Float, nullable=False)
     status = Column(
         String(16), nullable=False, default="pending"
@@ -72,6 +72,9 @@ class Invoice(Base):
     seller = relationship("Seller", back_populates="invoices")
     buyer_group = relationship("BuyerGroup", back_populates="invoices")
     transactions = relationship("Transaction", back_populates="invoice")
+    __table_args__ = (
+        UniqueConstraint("buyer_group_id", "derivation_index", name="uix_buyer_group_derivation_index"),
+    )
 
 
 class Transaction(Base):
