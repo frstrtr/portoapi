@@ -103,11 +103,28 @@ def log_and_handle(handler, action_name):
 
 
 async def main():
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_invoices, "/invoices"),
+        lambda m: m.text == "/invoices",
+    )
     # Register admin commands globally
     dp.message.register(
         handle_admin_xpubs, lambda m: m.text and m.text.startswith("/admin_xpubs")
     )
     logger.info("Starting Telegram bot...")
+
+
+    # Register handler to cancel FSM state if main command is sent during an active FSM flow
+    async def main_command_interrupt_predicate(message, state):
+        if message.text in seller_handlers.MAIN_COMMANDS and state:
+            current_state = await state.get_state()
+            return current_state is not None
+        return False
+
+    dp.message.register(
+        seller_handlers.handle_main_command_interrupt,
+        main_command_interrupt_predicate,
+    )
 
     # Register handlers with logging
     dp.message.register(
@@ -193,7 +210,7 @@ async def main():
     )
     dp.message.register(
         log_and_handle(seller_handlers.process_add_buyer_xpub, "add_buyer_xpub"),
-        "add_buyer_xpub",
+        seller_handlers.process_add_buyer_xpub,
     )
 
     max_retries = 10

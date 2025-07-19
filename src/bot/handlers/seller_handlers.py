@@ -1,3 +1,7 @@
+# Handler to cancel FSM state if main command is sent during an active FSM flow
+from aiogram.fsm.context import FSMContext
+
+
 # Обработчики всех команд продавца
 
 import logging
@@ -21,14 +25,16 @@ from src.core.database.db_service import (
     get_buyer_group,
     get_buyer_groups_by_seller,
     create_buyer_group,
+    get_wallets_by_seller,
     create_seller_wallet,
     update_seller,
 )
-from src.core.services.gas_station import prepare_for_sweep
+
 from src.core.crypto.xpub_validation import is_valid_xpub
 from src.core.services.gas_station import (
     get_or_create_tron_deposit_address,
     calculate_trx_needed,
+    prepare_for_sweep,
 )
 
 
@@ -46,6 +52,18 @@ from src.core.crypto.hd_wallet_service import generate_address_from_xpub
 
 
 logger = logging.getLogger("bot.seller_handlers")
+
+
+MAIN_COMMANDS = [
+    "/register",
+    "/deposit",
+    "/balance",
+    "/create_invoice",
+    "/buyers",
+    "/add_buyer",
+    "/sweep",
+    "/invoices",
+]
 
 
 # FSM для создания инвойса с выбором группы
@@ -70,6 +88,18 @@ class RegisterFSM(StatesGroup):
     choose_account_action = State()
     select_existing_account = State()
     ask_address = State()
+
+
+async def handle_main_command_interrupt(message: types.Message, state: FSMContext):
+    telegram_id = message.from_user.id
+    logger.info(
+        f"User {telegram_id} sent main command '{message.text}' during active FSM flow. Cancelling FSM state."
+    )
+    await state.clear()
+    await message.answer(
+        "❗️ Вы отправили основную команду во время незавершённого процесса. Предыдущий процесс был отменён. Пожалуйста, повторите команду, если требуется."
+    )
+    await show_main_menu(message, state)
 
 
 async def handle_register(message: types.Message, state: FSMContext = None):
@@ -138,7 +168,6 @@ async def process_choose_account_action(message: types.Message, state: FSMContex
     telegram_id = message.from_user.id
     db = message.bot.db
     choice = message.text.strip()
-    from src.core.database.db_service import get_wallets_by_seller
 
     wallets = get_wallets_by_seller(db, telegram_id)
     if choice == "Использовать существующий аккаунт":
@@ -207,13 +236,10 @@ async def show_main_menu(message: types.Message, state: FSMContext = None):
     """
     kb = types.ReplyKeyboardMarkup(
         keyboard=[
-            [types.KeyboardButton(text="/register")],
-            [types.KeyboardButton(text="/deposit")],
-            [types.KeyboardButton(text="/balance")],
-            [types.KeyboardButton(text="/create_invoice")],
-            [types.KeyboardButton(text="/buyers")],
-            [types.KeyboardButton(text="/add_buyer")],
-            [types.KeyboardButton(text="/sweep")],
+            [types.KeyboardButton(text="/register"), types.KeyboardButton(text="/deposit")],
+            [types.KeyboardButton(text="/balance"), types.KeyboardButton(text="/create_invoice")],
+            [types.KeyboardButton(text="/buyers"), types.KeyboardButton(text="/add_buyer")],
+            [types.KeyboardButton(text="/sweep"), types.KeyboardButton(text="/invoices")],
         ],
         resize_keyboard=True,
     )
@@ -384,10 +410,11 @@ async def process_invoice_group(message: types.Message, state: FSMContext):
     # Use buyer group's xpub and account index for address derivation
     buyer_group = get_buyer_group(db, telegram_id, buyer_id)
     if not buyer_group or not getattr(buyer_group, "xpub", None):
-        await message.answer("❌ Ошибка: не найден xPub для выбранной группы покупателя. Пожалуйста, добавьте группу с xPub.")
+        await message.answer(
+            "❌ Ошибка: не найден xPub для выбранной группы покупателя. Пожалуйста, добавьте группу с xPub."
+        )
         await state.clear()
         return
-    from src.core.database.db_service import get_invoices_by_seller
 
     existing_invoices = get_invoices_by_seller(db, telegram_id)
     # Only consider used addresses for this xpub and this account index (buyer group)
@@ -503,15 +530,27 @@ async def process_add_buyer_group(message: types.Message, state: FSMContext):
 async def process_add_buyer_xpub(message: types.Message, state: FSMContext):
     telegram_id = message.from_user.id
     data = await state.get_data()
-    buyer_id = data["buyer_id"]
-    invoices_group = data["invoices_group"]
+    buyer_id = data.get("buyer_id")
+    invoices_group = data.get("invoices_group")
     xpub = message.text.strip()
     db = message.bot.db
+    if buyer_id is None or invoices_group is None:
+        await message.answer(
+            "Ошибка: отсутствуют данные для создания группы покупателя. Пожалуйста, начните процесс добавления покупателя заново через /add_buyer."
+        )
+        await state.clear()
+        return
     # Store xpub with buyer group
     create_buyer_group(
-        db, seller_id=telegram_id, buyer_id=buyer_id, invoices_group=invoices_group, xpub=xpub
+        db,
+        seller_id=telegram_id,
+        buyer_id=buyer_id,
+        invoices_group=invoices_group,
+        xpub=xpub,
     )
-    logger.info(f"User {telegram_id} added buyer group: {buyer_id} | {invoices_group} | xpub: {xpub}")
+    logger.info(
+        f"User {telegram_id} added buyer group: {buyer_id} | {invoices_group} | xpub: {xpub}"
+    )
     await message.answer(
         f"Группа для покупателя {buyer_id} с номером {invoices_group} и xPub добавлена."
     )
@@ -567,7 +606,6 @@ async def process_register_xpub(message: types.Message, state: FSMContext):
     await state.update_data(xpub=xpub)
     db = message.bot.db
     # Find max account for this xpub and seller
-    from src.core.database.db_service import get_wallets_by_seller
 
     wallets = get_wallets_by_seller(db, telegram_id)
     same_xpub_wallets = [w for w in wallets if w.xpub == xpub]
@@ -595,7 +633,6 @@ async def process_register_account(message: types.Message, state: FSMContext):
     xpub = data.get("xpub")
     db = message.bot.db
     account = data.get("account")
-    from src.core.database.db_service import get_wallet_by_group, create_seller_wallet
 
     wallet = get_wallet_by_group(db, telegram_id, account)
     if wallet and wallet.xpub == xpub:
@@ -639,6 +676,37 @@ async def process_register_account(message: types.Message, state: FSMContext):
         "Адрес — это публичный адрес для получения средств, который будет связан с этим аккаунтом. Если не требуется, напишите 'нет'."
     )
     await state.set_state(RegisterFSM.ask_address)
+
+
+
+# --- Handler for /invoices command: show all invoices with details ---
+async def handle_invoices(message: types.Message):
+    telegram_id = message.from_user.id
+    logger.info(f"User {telegram_id} called /invoices")
+    db = message.bot.db
+    invoices = get_invoices_by_seller(db, telegram_id)
+    if not invoices:
+        await message.answer("У вас нет инвойсов.")
+        return
+    text = "Ваши инвойсы:\n"
+    for inv in invoices:
+        # Derivation path: m/44'/195'/account'/0/address_index
+        account = getattr(inv, 'buyer_group_id', '-')
+        address_index = getattr(inv, 'derivation_index', '-')
+        derivation_path = f"m/44'/195'/{account}'/0/{address_index}" if account != '-' and address_index != '-' else '-'
+        text += (
+            f"\nID: {inv.id}\n"
+            f"Статус: {inv.status}\n"
+            f"Сумма: {inv.amount}\n"
+            f"Адрес: {inv.address}\n"
+            f"Группа покупателя: {account}\n"
+            f"Индекс деривации: {address_index}\n"
+            f"Путь деривации: {derivation_path}\n"
+            f"Описание: {getattr(inv, 'description', '-') }\n"
+            f"Дата создания: {getattr(inv, 'created_at', '-') }\n"
+            "----------------------"
+        )
+    await message.answer(text)
 
 
 def register_registration_fsm_handlers(dp, seller_handlers):

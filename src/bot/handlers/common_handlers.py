@@ -8,20 +8,20 @@ async def handle_start(message: types.Message):
     kb = types.ReplyKeyboardMarkup(
         keyboard=[
             [
-                types.KeyboardButton(text="/help"),
-                types.KeyboardButton(text="/register")
+                types.KeyboardButton(text="/register"),
+                types.KeyboardButton(text="/deposit")
             ],
             [
-                types.KeyboardButton(text="/deposit"),
-                types.KeyboardButton(text="/balance")
+                types.KeyboardButton(text="/balance"),
+                types.KeyboardButton(text="/create_invoice")
             ],
             [
-                types.KeyboardButton(text="/create_invoice"),
-                types.KeyboardButton(text="/sweep")
+                types.KeyboardButton(text="/sweep"),
+                types.KeyboardButton(text="/buyers")
             ],
             [
-                types.KeyboardButton(text="/buyers"),
-                types.KeyboardButton(text="/add_buyer")
+                types.KeyboardButton(text="/add_buyer"),
+                types.KeyboardButton(text="/invoices")
             ]
         ],
         resize_keyboard=True

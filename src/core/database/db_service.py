@@ -3,10 +3,14 @@ from sqlalchemy.orm import sessionmaker
 from .models import Seller, Invoice, Transaction, Wallet, GasStation
 import os
 import logging
+from .models import BuyerGroup
+
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../'))  # points to project root
+BASE_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../../../")
+)  # points to project root
 DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'data', 'database.sqlite3')}"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -18,13 +22,11 @@ logger.info(f"Resolved DB_PATH: {DB_PATH}")
 
 # --- BUYER GROUPS CRUD ---
 def get_buyer_groups_by_seller(db, seller_id):
-    from .models import BuyerGroup
 
     return db.query(BuyerGroup).filter(BuyerGroup.seller_id == seller_id).all()
 
 
 def get_buyer_group(db, seller_id, buyer_id):
-    from .models import BuyerGroup
 
     return (
         db.query(BuyerGroup)
@@ -34,7 +36,6 @@ def get_buyer_group(db, seller_id, buyer_id):
 
 
 def create_buyer_group(db, seller_id, buyer_id, invoices_group, xpub=None):
-    from .models import BuyerGroup
 
     group = BuyerGroup(
         seller_id=seller_id, buyer_id=buyer_id, invoices_group=invoices_group, xpub=xpub
@@ -70,6 +71,9 @@ def get_seller(db, telegram_id):
 
 
 def update_seller(db, telegram_id, **kwargs):
+    """Update seller information by telegram_id.
+    Accepts any field from the Seller model."""
+
     seller = get_seller(db, telegram_id)
     for k, v in kwargs.items():
         setattr(seller, k, v)
@@ -168,9 +172,7 @@ def get_wallets_by_seller(db, telegram_id):
 def get_wallet_by_group(db, telegram_id, invoices_group):
     return (
         db.query(Wallet)
-        .filter(
-            Wallet.seller_id == telegram_id, Wallet.account == invoices_group
-        )
+        .filter(Wallet.seller_id == telegram_id, Wallet.account == invoices_group)
         .first()
     )
 
