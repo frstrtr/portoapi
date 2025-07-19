@@ -419,7 +419,7 @@ async def process_invoice_group(message: types.Message, state: FSMContext):
     # Find the first unused address index for this account (buyer group)
     next_address_index = 0
     while True:
-        candidate_address = generate_address_from_xpub(wallet.xpub, next_address_index, account=invoices_group)
+        candidate_address = generate_address_from_xpub(wallet.xpub, account=invoices_group, address_index=next_address_index)
         if candidate_address not in used_addresses:
             derived_address = candidate_address
             break
