@@ -16,12 +16,11 @@ if not mnemonic:
 print(f"Using mnemonic: {mnemonic}")
 
 
-def derive_private_key_from_xprv():
+def derive_private_key_from_xprv(account_idx=0):
     """
-    Prompts user for a derivation path, then derives and prints the private key for that path using the current mnemonic.
+    Derives and prints the private key for the given account and address index using the current mnemonic.
     """
     try:
-        account_idx = int(input("Enter account number (default 0): ").strip() or 0)
         addr_idx = int(input("Enter address index (default 0): ").strip() or 0)
         # Always use external addresses for Tron
         change = Bip44Changes.CHAIN_EXT
@@ -32,6 +31,8 @@ def derive_private_key_from_xprv():
         print(f"xprv for m/44'/195'/{account_idx}' : {xprv}")
         priv_ctx = account_ctx.Change(change).AddressIndex(addr_idx)
         privkey = priv_ctx.PrivateKey().Raw().ToHex()
+        address = priv_ctx.PublicKey().ToAddress()
+        print(f"Address: {address}")
         print(f"Private key for m/44'/195'/{account_idx}'/0/{addr_idx}: {privkey}")
     except Exception as e:
         print(f"Error: {e}")
@@ -46,42 +47,38 @@ additional addresses from the xPub.
 # Generate seed from mnemonic
 seed_bytes = Bip39SeedGenerator(mnemonic).Generate()
 
-# Derive BIP44 account for Tron (coin type 195)
+
+# Derive BIP44 coin context for Tron (coin type 195)
 bip44_ctx = Bip44.FromSeed(seed_bytes, Bip44Coins.TRON)
-account = bip44_ctx.Purpose().Coin().Account(0)
+coin_ctx = bip44_ctx.Purpose().Coin()
 
-# Derive the first address (m/44'/195'/0'/0/0)
-address = (
-    bip44_ctx.Purpose()
-    .Coin()
-    .Account(0)
-    .Change(Bip44Changes.CHAIN_EXT)
-    .AddressIndex(0)
-    .PublicKey()
-    .ToAddress()
-)
-print("Tron address (m/44'/195'/0'/0/0):", address)
+# Ask user for account index
+try:
+    account_idx = int(
+        input("Enter account number to derive addresses (default 0): ").strip() or 0
+    )
+except ValueError:
+    account_idx = 0
 
-# Get xpub at account level (m/44'/195'/0')
-xpub = account.PublicKey().ToExtended()
+# Derive account context and export account-level xpub
+account_ctx = coin_ctx.Account(account_idx)
+xpub = account_ctx.PublicKey().ToExtended()
+print(f"Tron ACCOUNT xpub (m/44'/195'/{account_idx}'): {xpub}")
 
-
-print("Tron MASTER xpub:", xpub)
-
-
-# Ask user how many addresses to generate from xpub
+# Ask user how many addresses to generate
 try:
     count = int(
-        input("How many Tron addresses to generate from xpub? (default 3): ").strip()
+        input(
+            "How many Tron addresses to generate from this account? (default 3): "
+        ).strip()
         or 3
     )
 except ValueError:
     count = 3
 
-# Create a Bip44 context from the xpub
+# Use account-level xpub for address derivation
 pub_ctx = Bip44.FromExtendedKey(xpub, Bip44Coins.TRON)
-print(f"First {count} Tron addresses from xpub (m/44'/195'/0'/0/i):")
-
+print(f"First {count} Tron addresses from m/44'/195'/{account_idx}'/0/i:")
 for i in range(count):
     addr = (
         pub_ctx.Change(Bip44Changes.CHAIN_EXT).AddressIndex(i).PublicKey().ToAddress()
@@ -89,15 +86,12 @@ for i in range(count):
     print(f"  Address {i}: {addr}")
 
 # Optionally, let user derive a private key from a supplied xprv and path
-if (
+if (lambda s: s == "" or s.lower() == "y")(
     input(
         "Do you want to derive a private key from a master private key and path? (y/N): "
-    )
-    .strip()
-    .lower()
-    == "y"
+    ).strip()
 ):
-    derive_private_key_from_xprv()
+    derive_private_key_from_xprv(account_idx)
 
 
 """
