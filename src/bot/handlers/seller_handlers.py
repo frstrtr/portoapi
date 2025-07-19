@@ -381,45 +381,28 @@ async def process_invoice_group(message: types.Message, state: FSMContext):
         return
     db = message.bot.db
 
-    # Always use master wallet (first wallet for seller) and derive address using buyer group as account index
-    wallets = get_wallets_by_seller(db, telegram_id)
-    if not wallets:
-        logger.error(
-            f"User {telegram_id} tried to create invoice but has no master wallet/xpub."
-        )
-        kb = types.ReplyKeyboardMarkup(
-            keyboard=[
-                [types.KeyboardButton(text="/register")],
-                [types.KeyboardButton(text="/deposit")],
-                [types.KeyboardButton(text="/balance")],
-                [types.KeyboardButton(text="/create_invoice")],
-                [types.KeyboardButton(text="/buyers")],
-                [types.KeyboardButton(text="/add_buyer")],
-                [types.KeyboardButton(text="/sweep")],
-            ],
-            resize_keyboard=True,
-        )
-        await message.answer(
-            "❌ Ошибка: не найден xPub для вашего аккаунта. Пожалуйста, зарегистрируйте xPub через /register.",
-            reply_markup=kb,
-        )
+    # Use buyer group's xpub and account index for address derivation
+    buyer_group = get_buyer_group(db, telegram_id, buyer_id)
+    if not buyer_group or not getattr(buyer_group, "xpub", None):
+        await message.answer("❌ Ошибка: не найден xPub для выбранной группы покупателя. Пожалуйста, добавьте группу с xPub.")
         await state.clear()
         return
-    wallet = wallets[0]
-    logger.info(f"Using master wallet xPub: {wallet.xpub} for buyer group/account {invoices_group}")
-    buyer_group = get_buyer_group(db, telegram_id, buyer_id)
-    # Always use buyer group as account index, and use a unique derivation index for each invoice (address index)
     from src.core.database.db_service import get_invoices_by_seller
+
     existing_invoices = get_invoices_by_seller(db, telegram_id)
     # Only consider used addresses for this xpub and this account index (buyer group)
     used_addresses = set(
-        inv.address for inv in existing_invoices
-        if inv.derivation_index is not None and getattr(inv, "buyer_group_id", None) == buyer_group.id
+        inv.address
+        for inv in existing_invoices
+        if inv.derivation_index is not None
+        and getattr(inv, "buyer_group_id", None) == buyer_group.id
     )
     # Find the first unused address index for this account (buyer group)
     next_address_index = 0
     while True:
-        candidate_address = generate_address_from_xpub(wallet.xpub, account=invoices_group, address_index=next_address_index)
+        candidate_address = generate_address_from_xpub(
+            buyer_group.xpub, account=invoices_group, address_index=next_address_index
+        )
         if candidate_address not in used_addresses:
             derived_address = candidate_address
             break
@@ -447,7 +430,9 @@ async def process_invoice_group(message: types.Message, state: FSMContext):
     img.save(buf, format="PNG")
     buf.seek(0)
     await message.answer(
-        f"Инвойс создан!\nАдрес: <code>{invoice.address}</code>\nСумма: <b>{data['amount']}</b>\nОписание: {data['description']}\nГруппа: {buyer_id}\n\nПуть деривации: <code>{derivation_path}</code>",
+        f"Инвойс создан!\nАдрес: <code>{invoice.address}</code>\n"
+        f"Сумма: <b>{data['amount']}</b>\nОписание: {data['description']}\n"
+        f"Группа: {buyer_id}\n\nПуть деривации: <code>{derivation_path}</code>",
         parse_mode="HTML",
     )
     await message.answer_photo(
@@ -508,14 +493,27 @@ async def process_add_buyer_group(message: types.Message, state: FSMContext):
         )
         await message.answer("Некорректный номер группы. Введите целое число.")
         return
-    db = message.bot.db
+    # Ask for xPUB for this buyer/account
+    await state.update_data(invoices_group=invoices_group)
+    await message.answer("Пожалуйста, отправьте xPub для этого покупателя/аккаунта:")
+    await state.set_state("add_buyer_xpub")
 
+
+# New FSM state handler for buyer xPUB
+async def process_add_buyer_xpub(message: types.Message, state: FSMContext):
+    telegram_id = message.from_user.id
+    data = await state.get_data()
+    buyer_id = data["buyer_id"]
+    invoices_group = data["invoices_group"]
+    xpub = message.text.strip()
+    db = message.bot.db
+    # Store xpub with buyer group
     create_buyer_group(
-        db, seller_id=telegram_id, buyer_id=buyer_id, invoices_group=invoices_group
+        db, seller_id=telegram_id, buyer_id=buyer_id, invoices_group=invoices_group, xpub=xpub
     )
-    logger.info(f"User {telegram_id} added buyer group: {buyer_id} | {invoices_group}")
+    logger.info(f"User {telegram_id} added buyer group: {buyer_id} | {invoices_group} | xpub: {xpub}")
     await message.answer(
-        f"Группа для покупателя {buyer_id} с номером {invoices_group} добавлена."
+        f"Группа для покупателя {buyer_id} с номером {invoices_group} и xPub добавлена."
     )
     await show_main_menu(message, state)
     await state.clear()
@@ -634,9 +632,7 @@ async def process_register_account(message: types.Message, state: FSMContext):
     # The public address is safe to share and is used to receive funds for this account.
     # If not needed, the user can reply 'нет' and the bot will use the default derived address.
     # ---
-    await message.answer(
-        f"Аккаунт BIP44 {account} успешно сохранён для xPub!"
-    )
+    await message.answer(f"Аккаунт BIP44 {account} успешно сохранён для xPub!")
     await show_main_menu(message, state)
     await message.answer(
         "Теперь укажите адрес для этого аккаунта (или напишите 'нет', если не требуется):\n\n"
@@ -660,6 +656,10 @@ def register_registration_fsm_handlers(dp, seller_handlers):
     dp.message.register(
         seller_handlers.process_register_account,
         seller_handlers.RegisterFSM.get_account,
+    )
+    dp.message.register(
+        seller_handlers.process_add_buyer_xpub,
+        "add_buyer_xpub",
     )
 
 
