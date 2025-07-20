@@ -1,4 +1,3 @@
-# Handler to cancel FSM state if main command is sent during an active FSM flow
 from aiogram.fsm.context import FSMContext
 
 
@@ -77,7 +76,7 @@ class InvoiceFSM(StatesGroup):
 # FSM для добавления покупателя/группы
 class AddBuyerFSM(StatesGroup):
     buyer_id = State()
-    group_name = State()
+    xpub = State()
 
 
 # FSM для регистрации
@@ -138,8 +137,7 @@ async def handle_register(message: types.Message, state: FSMContext = None):
         kb = types.ReplyKeyboardMarkup(
             keyboard=[
                 [types.KeyboardButton(text="Использовать существующий аккаунт")],
-                [types.KeyboardButton(text="Создать новый аккаунт в этом xPub")],
-                [types.KeyboardButton(text="Создать новый кошелек (новый xPub)")],
+                [types.KeyboardButton(text="Create new wallet (new seed phrase)")],
             ],
             resize_keyboard=True,
         )
@@ -185,20 +183,11 @@ async def process_choose_account_action(message: types.Message, state: FSMContex
         await message.answer("Выберите аккаунт для использования:", reply_markup=kb)
         await state.set_state(RegisterFSM.select_existing_account)
         return
-    elif choice == "Создать новый аккаунт в этом xPub":
-        # Ask for xPub to use (show list)
-        xpubs = list(set([w.xpub for w in wallets]))
-        kb = types.ReplyKeyboardMarkup(keyboard=[], resize_keyboard=True)
-        for xpub in xpubs:
-            kb.keyboard.append([types.KeyboardButton(text=f"{xpub}")])
+    elif choice == "Create new wallet (new seed phrase)":
         await message.answer(
-            "Выберите xPub для создания нового аккаунта:", reply_markup=kb
+            "⚠️ To create a new wallet, you must use a new seed phrase. Generate a new seed phrase, get the xPub, and send it here. Never use your old seed phrase for a new wallet!"
         )
-        await state.update_data(wallets=wallets)
-        await state.set_state(RegisterFSM.get_xpub)
-        return
-    elif choice == "Создать новый кошелек (новый xPub)":
-        await message.answer("Пожалуйста, отправьте новый xPub:")
+        await message.answer("Please send the new xPub:")
         await state.set_state(RegisterFSM.get_xpub)
         return
     else:
@@ -223,7 +212,7 @@ async def process_select_existing_account(message: types.Message, state: FSMCont
         )
         return
     await message.answer(
-        f"Вы выбрали аккаунт {account} для xPub {xpub}. Регистрация пропущена, можно использовать этот аккаунт."
+        f"Вы выбрали аккаунт {account} для xPub {xpub}. Теперь вы можете использовать этот аккаунт."
     )
     await show_main_menu(message, state)
     await state.clear()
@@ -236,20 +225,27 @@ async def show_main_menu(message: types.Message, state: FSMContext = None):
     """
     kb = types.ReplyKeyboardMarkup(
         keyboard=[
-            [types.KeyboardButton(text="/register"), types.KeyboardButton(text="/deposit")],
-            [types.KeyboardButton(text="/balance"), types.KeyboardButton(text="/create_invoice")],
-            [types.KeyboardButton(text="/buyers"), types.KeyboardButton(text="/add_buyer")],
-            [types.KeyboardButton(text="/sweep"), types.KeyboardButton(text="/invoices")],
+            [
+                types.KeyboardButton(text="/register"),
+                types.KeyboardButton(text="/deposit"),
+            ],
+            [
+                types.KeyboardButton(text="/balance"),
+                types.KeyboardButton(text="/create_invoice"),
+            ],
+            [
+                types.KeyboardButton(text="/buyers"),
+                types.KeyboardButton(text="/add_buyer"),
+            ],
+            [
+                types.KeyboardButton(text="/sweep"),
+                types.KeyboardButton(text="/invoices"),
+            ],
         ],
         resize_keyboard=True,
     )
     await message.answer("Вы вернулись в главное меню.", reply_markup=kb)
-    await message.answer(
-        "Регистрация нового HD кошелька.\n\n"
-        "Пожалуйста, отправьте ваш xPub (или напишите 'нет', чтобы получить инструкцию)."
-    )
-    if state is not None:
-        await state.set_state(RegisterFSM.get_xpub)
+    # Only prompt for xPub if explicitly required by registration flow, not after account selection
     return
 
     # # Non-FSM registration flow
@@ -372,6 +368,7 @@ async def process_group_name_for_invoice(message: types.Message, state: FSMConte
         normalized == "нет"
         or normalized == "использовать группу по умолчанию"
         or not normalized
+        or normalized == "general"
     ):
         group_name = "General"
     logger.info(f"User {telegram_id} creating default buyer group: {group_name}")
@@ -385,7 +382,7 @@ async def process_group_name_for_invoice(message: types.Message, state: FSMConte
             [types.KeyboardButton(text=f"{g.buyer_id} | {g.invoices_group}")]
         )
     await message.answer(
-        f"Группа '{group_name}' создана. Выберите покупателя/группу:", reply_markup=kb
+        f"Группа '{group_name}' создана. Выберите покупателя:", reply_markup=kb
     )
     await state.set_state(InvoiceFSM.group)
 
@@ -481,9 +478,19 @@ async def handle_buyers(message: types.Message):
         logger.info(f"User {telegram_id} has no buyer groups")
         await message.answer("У вас нет групп покупателей. Добавьте через /add_buyer.")
         return
-    text = "Ваши группы покупателей:\n"
-    for g in groups:
-        text += f"- {g.buyer_id} | {g.invoices_group}\n"
+    # Sort groups by account number (invoices_group)
+    groups_sorted = sorted(groups, key=lambda g: g.invoices_group)
+    text = "Registered Buyers:\n"
+    db = message.bot.db
+    for g in groups_sorted:
+        # Count invoices for this buyer group
+        invoices = get_invoices_by_seller(db, telegram_id)
+        count = sum(
+            1
+            for inv in invoices
+            if getattr(inv, "buyer_group_id", None) == getattr(g, "id", None)
+        )
+        text += f"- {g.buyer_id} | Account: {g.invoices_group} | {count} invoice(s)\n"
     logger.info(f"User {telegram_id} buyer groups listed")
     await message.answer(text)
 
@@ -500,30 +507,23 @@ async def handle_add_buyer(message: types.Message, state: FSMContext):
 async def process_add_buyer_id(message: types.Message, state: FSMContext):
     telegram_id = message.from_user.id
     logger.info(f"User {telegram_id} entered buyer_id: {message.text.strip()}")
+    db = message.bot.db
+    buyers = get_buyer_groups_by_seller(db, telegram_id)
+    used_accounts = set(b.invoices_group for b in buyers)
+    next_account = 0
+    while next_account in used_accounts:
+        next_account += 1
     await state.update_data(buyer_id=message.text.strip())
-    await message.answer("Введите номер группы (BIP44 account, например 0, 1, 2...):")
-    await state.set_state(AddBuyerFSM.group_name)
+    await message.answer(
+        f"Для этого покупателя используйте account #{next_account} при генерации xPub с вашим seed phrase.\n"
+        "Пожалуйста, отправьте xPub для этого покупателя:"
+    )
+    await state.set_state(AddBuyerFSM.xpub)
 
 
 async def process_add_buyer_group(message: types.Message, state: FSMContext):
-    telegram_id = message.from_user.id
-    data = await state.get_data()
-    buyer_id = data["buyer_id"]
-    logger.info(
-        f"User {telegram_id} entered group number: {message.text.strip()} for buyer_id: {buyer_id}"
-    )
-    try:
-        invoices_group = int(message.text.strip())
-    except Exception:
-        logger.warning(
-            f"User {telegram_id} provided invalid group number: {message.text.strip()}"
-        )
-        await message.answer("Некорректный номер группы. Введите целое число.")
-        return
-    # Ask for xPUB for this buyer/account
-    await state.update_data(invoices_group=invoices_group)
-    await message.answer("Пожалуйста, отправьте xPub для этого покупателя/аккаунта:")
-    await state.set_state("add_buyer_xpub")
+    # No longer needed, merged with xpub step
+    pass
 
 
 # New FSM state handler for buyer xPUB
@@ -531,28 +531,26 @@ async def process_add_buyer_xpub(message: types.Message, state: FSMContext):
     telegram_id = message.from_user.id
     data = await state.get_data()
     buyer_id = data.get("buyer_id")
-    invoices_group = data.get("invoices_group")
     xpub = message.text.strip()
     db = message.bot.db
-    if buyer_id is None or invoices_group is None:
-        await message.answer(
-            "Ошибка: отсутствуют данные для создания группы покупателя. Пожалуйста, начните процесс добавления покупателя заново через /add_buyer."
-        )
-        await state.clear()
-        return
-    # Store xpub with buyer group
+    # Find next available account index for this seller
+    buyers = get_buyer_groups_by_seller(db, telegram_id)
+    used_accounts = set(b.invoices_group for b in buyers)
+    next_account = 0
+    while next_account in used_accounts:
+        next_account += 1
     create_buyer_group(
         db,
         seller_id=telegram_id,
         buyer_id=buyer_id,
-        invoices_group=invoices_group,
+        invoices_group=next_account,
         xpub=xpub,
     )
     logger.info(
-        f"User {telegram_id} added buyer group: {buyer_id} | {invoices_group} | xpub: {xpub}"
+        f"User {telegram_id} added buyer: {buyer_id} | account: {next_account} | xpub: {xpub}"
     )
     await message.answer(
-        f"Группа для покупателя {buyer_id} с номером {invoices_group} и xPub добавлена."
+        f"Покупатель {buyer_id} с аккаунтом {next_account} и xPub добавлен."
     )
     await show_main_menu(message, state)
     await state.clear()
@@ -596,87 +594,54 @@ async def process_register_xpub(message: types.Message, state: FSMContext):
         )
         await state.clear()
         return
-    xpub = text
-    if not is_valid_xpub(xpub):
-        logger.warning(f"User {telegram_id} provided invalid xPub: {xpub}")
-        await message.answer(
-            "Некорректный xPub. Пожалуйста, проверьте и отправьте корректный xPub."
-        )
-        return
-    await state.update_data(xpub=xpub)
-    db = message.bot.db
-    # Find max account for this xpub and seller
-
-    wallets = get_wallets_by_seller(db, telegram_id)
-    same_xpub_wallets = [w for w in wallets if w.xpub == xpub]
-    if same_xpub_wallets:
-        next_account = (
-            max(
-                [w.account for w in same_xpub_wallets if w.account is not None],
-                default=-1,
+    # Only validate xPub if the user is registering a new wallet, not when choosing an existing account
+    # If FSM state is RegisterFSM.get_xpub, validate xPub
+    current_state = await state.get_state()
+    if current_state == RegisterFSM.get_xpub.state:
+        xpub = text
+        if not is_valid_xpub(xpub):
+            logger.warning(f"User {telegram_id} provided invalid xPub: {xpub}")
+            await message.answer(
+                "Некорректный xPub. Пожалуйста, проверьте и отправьте корректный xPub."
             )
-            + 1
+            return
+    db = message.bot.db
+    buyers = get_buyer_groups_by_seller(db, telegram_id)
+    if not buyers:
+        # First xPub, assign to default buyer 'General' with account 0
+        create_buyer_group(
+            db,
+            seller_id=telegram_id,
+            buyer_id="General",
+            invoices_group=0,
+            xpub=xpub,
         )
-    else:
-        next_account = 0
-    await state.update_data(account=next_account)
-    await message.answer(
-        f"Аккаунт BIP44 для этого xPub будет автоматически назначен: {next_account}. Продолжаем регистрацию..."
+        logger.info(
+            f"User {telegram_id} registered first xPub for default buyer 'General'"
+        )
+        await message.answer(
+            "Ваш xPub успешно зарегистрирован для покупателя 'General' (аккаунт 0)."
+        )
+        await show_main_menu(message, state)
+        await state.clear()
+        return
+    # If buyers exist, ask user for buyer name or use next available account, with buttons
+    kb = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="General")],
+            [types.KeyboardButton(text="Указать имя покупателя")],
+        ],
+        resize_keyboard=True,
     )
-    await process_register_account(message, state)
+    await message.answer("Выберите действие для нового xPub:", reply_markup=kb)
+    await state.update_data(xpub=xpub)
+    await state.set_state("register_buyer_name")
 
 
 async def process_register_account(message: types.Message, state: FSMContext):
-    telegram_id = message.from_user.id
-    # If called from auto mode, get account from state
-    data = await state.get_data()
-    xpub = data.get("xpub")
-    db = message.bot.db
-    account = data.get("account")
-
-    wallet = get_wallet_by_group(db, telegram_id, account)
-    if wallet and wallet.xpub == xpub:
-        await message.answer(
-            f"Этот xPub уже зарегистрирован для аккаунта {account}. Регистрация пропущена."
-        )
-        await state.clear()
-        return
-    if wallet:
-        wallet.xpub = xpub
-        wallet.account = account
-        db.commit()
-        logger.info(
-            f"User {telegram_id} xPub updated in wallet: {xpub} (account {account})"
-        )
-    else:
-        create_seller_wallet(
-            db,
-            seller_id=telegram_id,
-            xpub=xpub,
-            account=account,
-            address=None,
-            derivation_path=None,
-            deposit_type=None,
-        )
-        logger.info(
-            f"User {telegram_id} registered new xPub and wallet created: {xpub} (account {account})"
-        )
-    await state.update_data(account=account)
-    # ---
-    # The following prompt asks the user to provide a public receiving address for the registered account.
-    # By default, the bot will derive this address from the xPub and BIP44 account index.
-    # However, the user can override it by specifying a custom address (for advanced integrations, external wallets, or business needs).
-    # The public address is safe to share and is used to receive funds for this account.
-    # If not needed, the user can reply 'нет' and the bot will use the default derived address.
-    # ---
-    await message.answer(f"Аккаунт BIP44 {account} успешно сохранён для xPub!")
-    await show_main_menu(message, state)
-    await message.answer(
-        "Теперь укажите адрес для этого аккаунта (или напишите 'нет', если не требуется):\n\n"
-        "Адрес — это публичный адрес для получения средств, который будет связан с этим аккаунтом. Если не требуется, напишите 'нет'."
-    )
-    await state.set_state(RegisterFSM.ask_address)
-
+    # This registration logic is now handled in process_register_xpub
+    pass
+    register_buyer_name = State()
 
 
 # --- Handler for /invoices command: show all invoices with details ---
@@ -690,16 +655,32 @@ async def handle_invoices(message: types.Message):
         return
     text = "Ваши инвойсы:\n"
     for inv in invoices:
-        # Derivation path: m/44'/195'/account'/0/address_index
-        account = getattr(inv, 'buyer_group_id', '-')
-        address_index = getattr(inv, 'derivation_index', '-')
-        derivation_path = f"m/44'/195'/{account}'/0/{address_index}" if account != '-' and address_index != '-' else '-'
+        # Use buyer_group_id to lookup correct buyer group and account index
+        buyer_group_id = getattr(inv, "buyer_group_id", None)
+        buyer_group = None
+        if buyer_group_id is not None:
+            # get_buyer_groups_by_seller returns all groups, find by id
+            all_groups = get_buyer_groups_by_seller(db, telegram_id)
+            for g in all_groups:
+                if getattr(g, "id", None) == buyer_group_id:
+                    buyer_group = g
+                    break
+        account_index = (
+            getattr(buyer_group, "invoices_group", "-") if buyer_group else "-"
+        )
+        buyer_id = getattr(buyer_group, "buyer_id", "-") if buyer_group else "-"
+        address_index = getattr(inv, "derivation_index", "-")
+        derivation_path = (
+            f"m/44'/195'/{account_index}'/0/{address_index}"
+            if account_index != "-" and address_index != "-"
+            else "-"
+        )
         text += (
             f"\nID: {inv.id}\n"
             f"Статус: {inv.status}\n"
             f"Сумма: {inv.amount}\n"
             f"Адрес: {inv.address}\n"
-            f"Группа покупателя: {account}\n"
+            f"Группа покупателя: {buyer_id}\n"
             f"Индекс деривации: {address_index}\n"
             f"Путь деривации: {derivation_path}\n"
             f"Описание: {getattr(inv, 'description', '-') }\n"
@@ -707,28 +688,6 @@ async def handle_invoices(message: types.Message):
             "----------------------"
         )
     await message.answer(text)
-
-
-def register_registration_fsm_handlers(dp, seller_handlers):
-    dp.message.register(
-        seller_handlers.process_choose_account_action,
-        seller_handlers.RegisterFSM.choose_account_action,
-    )
-    dp.message.register(
-        seller_handlers.process_select_existing_account,
-        seller_handlers.RegisterFSM.select_existing_account,
-    )
-    dp.message.register(
-        seller_handlers.process_register_xpub, seller_handlers.RegisterFSM.get_xpub
-    )
-    dp.message.register(
-        seller_handlers.process_register_account,
-        seller_handlers.RegisterFSM.get_account,
-    )
-    dp.message.register(
-        seller_handlers.process_add_buyer_xpub,
-        "add_buyer_xpub",
-    )
 
 
 # # --- Admin command: /admin_xpubs <seller_id> ---
@@ -761,3 +720,66 @@ def register_registration_fsm_handlers(dp, seller_handlers):
 #     for w in wallets:
 #         text += f"- group: {w.invoices_group}, xpub: {w.xpub}\n"
 #     await message.answer(text)
+
+
+# --- Help command handler ---
+async def handle_help(message: types.Message):
+    help_text = (
+        "<b>Help & Definitions</b>\n\n"
+        "<b>Wallet:</b> In this platform, a wallet is defined by an xPub (extended public key) generated from a UNIQUE seed phrase (mnemonic). Each wallet can have multiple accounts.\n\n"
+        "<b>xPub:</b> The extended public key is generated from your seed phrase and allows you to derive addresses for all accounts and invoices without exposing your private keys.\n\n"
+        "<b>Seed Phrase:</b> A sequence of words used to generate your wallet and all its accounts. Never share your seed phrase.\n\n"
+        "<b>Account:</b> An account is a logical sub-wallet within your xPub. Each buyer is assigned a unique account number.\n"
+        "The account number is used to separate funds and addresses for different buyers.\n\n"
+        "<b>Address Index:</b> Within each account, addresses are generated using an incrementing address index. Each invoice gets a unique address by increasing this index.\n\n"
+        "<b>Buyer:</b> Represents a customer or group. Each buyer is linked to a specific account in your wallet.\n\n"
+        "<b>Invoice:</b> A payment request generated for a buyer. Each invoice uses a unique address derived from your wallet's xPub, account, and address index.\n\n"
+        "<b>Difference between Wallet, Account, and Address Index:</b>\n"
+        "- <b>Wallet</b> is the whole structure generated from your seed phrase (mnemonic).\n"
+        "- <b>xPub</b> is the extended public key for your wallet, used to derive all addresses.\n"
+        "- <b>Account</b> is a logical partition inside your wallet, used for buyers.\n"
+        "- <b>Address Index</b> is the number of the address within an account, incremented for each invoice.\n"
+        "- <b>Derivation Path:</b> m/44'/195'/account'/0/address_index\n\n"
+        "<b>Key commands:</b>\n"
+        "/register - Register or manage your wallets (xPub)\n"
+        "/buyers - List your buyers and their accounts\n"
+        "/add_buyer - Add a new buyer (creates a new account in your wallet)\n"
+        "/create_invoice - Create a new invoice for a buyer\n"
+        "/invoices - List all invoices\n"
+        "/deposit - Get your TRON deposit address for gas\n"
+        "/balance - Show your TRON gas balance\n"
+        "/sweep - Sweep paid invoices\n"
+        "/help - Show this help message\n\n"
+        "<b>Important:</b> To create a new wallet, you must use a new seed phrase and generate a new xPub. Never reuse a seed phrase for multiple wallets.\n"
+        "Each account is unique for each buyer. Addresses are derived as: m/44'/195'/account'/0/address_index."
+    )
+    await message.answer(help_text, parse_mode="HTML")
+
+
+def register_registration_fsm_handlers(dp, seller_handlers):
+    dp.message.register(
+        seller_handlers.process_choose_account_action,
+        seller_handlers.RegisterFSM.choose_account_action,
+    )
+    dp.message.register(
+        seller_handlers.process_select_existing_account,
+        seller_handlers.RegisterFSM.select_existing_account,
+    )
+    dp.message.register(
+        seller_handlers.process_register_xpub, seller_handlers.RegisterFSM.get_xpub
+    )
+    dp.message.register(
+        seller_handlers.process_register_account,
+        seller_handlers.RegisterFSM.get_account,
+    )
+    dp.message.register(
+        seller_handlers.process_add_buyer_xpub,
+        "add_buyer_xpub",
+    )
+
+
+def register_help_handler(dp, seller_handlers):
+    dp.message.register(seller_handlers.handle_help, commands=["help"])
+
+
+# Handler to cancel FSM state if main command is sent during an active FSM flow

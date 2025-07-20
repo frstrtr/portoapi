@@ -205,10 +205,6 @@ async def main():
         seller_handlers.AddBuyerFSM.buyer_id,
     )
     dp.message.register(
-        log_and_handle(seller_handlers.process_add_buyer_group, "add_buyer_group"),
-        seller_handlers.AddBuyerFSM.group_name,
-    )
-    dp.message.register(
         log_and_handle(seller_handlers.process_add_buyer_xpub, "add_buyer_xpub"),
         seller_handlers.process_add_buyer_xpub,
     )
