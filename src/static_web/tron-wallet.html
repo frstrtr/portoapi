@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Tron Wallet Generator (Mnemonic → Tron Address/xPub)</title>
+    <style>
+        body { font-family: sans-serif; margin: 2em; }
+        input, button { font-size: 1em; margin: 0.5em 0; }
+        .output { margin-top: 1em; padding: 1em; background: #f8f8f8; border-radius: 6px; }
+    </style>
+</head>
+<body>
+    <h2>Tron Wallet Generator</h2>
+    <button onclick="generateMnemonic()">Generate Mnemonic</button>
+    <input id="mnemonic" type="text" style="width:100%" placeholder="Or paste your mnemonic here..." />
+    <button onclick="deriveTron()">Derive Tron Address & xPub</button>
+    <div class="output" id="output"></div>
+    <script src="js/bip39.js"></script>
+    <script src="js/hdkey.js"></script>
+    <script src="js/english.js"></script>
+    <script>
+    function generateMnemonic() {
+        var mnemonic = window.bip39.generateMnemonic(window.bip39EnglishWordlist);
+        document.getElementById('mnemonic').value = mnemonic;
+    }
+    function deriveTron() {
+        var mnemonic = document.getElementById('mnemonic').value.trim();
+        if (!window.bip39.validateMnemonic(mnemonic, window.bip39EnglishWordlist)) {
+            document.getElementById('output').innerHTML = '<span style="color:red">Invalid mnemonic</span>';
+            return;
+        }
+        var seed = window.bip39.mnemonicToSeedHex(mnemonic);
+        var hdkey = window.hdkey.fromMasterSeed(hexToBytes(seed));
+        // Tron derivation path: m/44'/195'/0'/0/0
+        var path = "m/44'/195'/0'/0/0";
+        var child = hdkey.derive(path);
+        var pubkey = child.publicKey;
+        var tronAddr = tronAddressFromPubKey(pubkey);
+        var xpub = hdkey.derive("m/44'/195'/0'").publicExtendedKey;
+        document.getElementById('output').innerHTML =
+            '<b>Tron Address:</b> ' + tronAddr + '<br>' +
+            '<b>xPub:</b> ' + xpub;
+    }
+    // Helper: hex string to byte array
+    function hexToBytes(hex) {
+        for (var bytes = [], c = 0; c < hex.length; c += 2)
+            bytes.push(parseInt(hex.substr(c, 2), 16));
+        return bytes;
+    }
+    // Tron address from secp256k1 pubkey
+    function tronAddressFromPubKey(pubkey) {
+        // 1. SHA3-256 (keccak) hash of pubkey (skip first byte if uncompressed)
+        var pub = pubkey.length === 65 ? pubkey.slice(1) : pubkey;
+        var hash = keccak256(pub);
+        // 2. Take last 20 bytes, prepend 0x41
+        var addr = [0x41].concat(Array.from(hash.slice(-20)));
+        // 3. Base58Check encode
+        return base58check(addr);
+    }
+    // Keccak256 implementation (from bip39-standalone)
+    function keccak256(arr) {
+        return window.keccak_256 ? window.keccak_256.array(arr) : [];
+    }
+    // Base58Check implementation (from bip39-standalone)
+    function base58check(bytes) {
+        var sha256 = window.sha256;
+        var base58 = window.base58;
+        var checksum = sha256(sha256(bytes)).slice(0, 4);
+        var full = bytes.concat(Array.from(checksum));
+        return base58.encode(full);
+    }
+    </script>
+    <!-- You must provide keccak_256, sha256, and base58 implementations (from bip39-standalone) in js/ -->
+</body>
+</html>
