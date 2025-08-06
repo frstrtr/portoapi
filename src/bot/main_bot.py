@@ -111,6 +111,13 @@ async def main():
     dp.message.register(
         handle_admin_xpubs, lambda m: m.text and m.text.startswith("/admin_xpubs")
     )
+    
+    # Register /myaccount handler
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_myaccount, "/myaccount"),
+        lambda m: m.text == "/myaccount",
+    )
+    
     logger.info("Starting Telegram bot...")
 
 

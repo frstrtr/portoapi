@@ -25,22 +25,113 @@
 - FSM автоматически сбрасывается при вводе основной команды.
 
 ## Быстрый старт
-1. Установите зависимости:
-   ```bash
-   pip install -r src/requirements.txt
-   ```
-2. Запустите API:
-   ```bash
-   uvicorn src.api.v1.main:app --reload
-   ```
-3. Запустите Telegram-бота:
-   ```bash
-   python src/bot/main_bot.py
-   ```
-4. Запустите keeper-бота:
-   ```bash
-   python src/services/keeper_bot.py
-   ```
+
+### 1. Установите зависимости:
+```bash
+pip install -r src/requirements.txt
+```
+
+### 2. Настройте конфигурацию:
+```bash
+# Скопируйте шаблон конфигурации
+cp .env.example .env
+
+# Отредактируйте .env файл с вашими настройками
+# См. docs/CONFIGURATION_GUIDE.md для подробной инструкции
+```
+
+### 3. Проверьте конфигурацию:
+```bash
+python scripts/validate_config.py
+```
+
+### 4. Для разработки сгенерируйте тестовый кошелёк:
+```bash
+python scripts/generate_test_wallet.py
+```
+pip install -r src/requirements.txt
+```
+
+### 2. Настройте конфигурацию:
+```bash
+# Скопируйте пример конфигурации
+cp .env.example .env
+
+# Отредактируйте .env файл с вашими настройками:
+# - TELEGRAM_BOT_TOKEN (получите у @BotFather)
+# - TRON_NETWORK (mainnet или testnet)
+# - GAS_STATION_TYPE (single или multisig)
+# - GAS_WALLET_PRIVATE_KEY или GAS_WALLET_MNEMONIC
+```
+
+### 3. Создайте директорию для базы данных:
+```bash
+mkdir -p data
+```
+
+### 4. Проверьте конфигурацию:
+```bash
+python scripts/validate_config.py
+```
+
+### 5. Запустите сервисы:
+
+#### Telegram-бот:
+```bash
+python scripts/start.py bot
+# или классический способ:
+python -m src.bot.main_bot
+```
+
+#### API сервер:
+```bash
+python scripts/start.py api
+# или:
+uvicorn src.api.v1.main:app --reload
+```
+
+#### Keeper-бот (мониторинг блокчейна):
+```bash
+python scripts/start.py keeper
+# или:
+python -m src.services.keeper_bot
+```
+
+## Конфигурация
+
+### Сеть TRON
+Система поддерживает как mainnet, так и testnet TRON:
+
+- **Testnet**: Для разработки и тестирования
+- **Mainnet**: Для продакшена
+
+### Gas Station (Активация адресов)
+
+#### Режим Single Wallet
+Использует один кошелек для всех операций активации:
+```env
+GAS_STATION_TYPE=single
+GAS_WALLET_PRIVATE_KEY=your_private_key
+# или
+GAS_WALLET_MNEMONIC=your mnemonic phrase here
+```
+
+#### Режим Multisig (планируется)
+Использует мультиподписной контракт:
+```env
+GAS_STATION_TYPE=multisig
+MULTISIG_CONTRACT_ADDRESS=TMultiSigAddress
+MULTISIG_REQUIRED_SIGNATURES=2
+MULTISIG_OWNER_KEYS=key1,key2,key3
+```
+
+### Настройка ресурсов
+Контролируйте количество TRX для операций:
+```env
+AUTO_ACTIVATION_TRX_AMOUNT=1.5    # Активация адреса
+ENERGY_DELEGATION_TRX_AMOUNT=1.1  # Делегирование ENERGY  
+BANDWIDTH_DELEGATION_TRX_AMOUNT=1.0 # Делегирование BANDWIDTH
+```
 
 ## Настройка кошелька продавца
 - Перейдите на `/src/static_web/setup.html` или используйте `xpub_offline.html` для генерации xPub.

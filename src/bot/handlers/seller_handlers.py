@@ -49,12 +49,16 @@ from src.core.database.db_service import get_wallets_by_seller
 
 from src.core.crypto.hd_wallet_service import generate_address_from_xpub
 
+# Import common handlers for keyboard
+from src.bot.handlers.common_handlers import get_main_menu_keyboard
+
 
 logger = logging.getLogger("bot.seller_handlers")
 
 
 MAIN_COMMANDS = [
     "/register",
+    "/myaccount",
     "/deposit",
     "/balance",
     "/create_invoice",
@@ -101,6 +105,97 @@ async def handle_main_command_interrupt(message: types.Message, state: FSMContex
     await show_main_menu(message, state)
 
 
+async def handle_myaccount(message: types.Message):
+    """Show detailed account information for registered users"""
+    telegram_id = message.from_user.id
+    db = message.bot.db
+    
+    try:
+        # Get seller information
+        seller = get_seller(db=db, telegram_id=telegram_id)
+        if not seller:
+            await message.answer(
+                "❌ Вы не зарегистрированы. Используйте /register для регистрации.",
+                reply_markup=get_main_menu_keyboard(is_registered=False)
+            )
+            return
+        
+        # Get user info from Telegram
+        user = message.from_user
+        user_info = []
+        user_info.append("👤 **Информация о пользователе:**")
+        user_info.append(f"• ID: `{user.id}`")
+        user_info.append(f"• Имя: {user.first_name or 'Не указано'}")
+        if user.last_name:
+            user_info.append(f"• Фамилия: {user.last_name}")
+        if user.username:
+            user_info.append(f"• Username: @{user.username}")
+        else:
+            user_info.append("• Username: Не указан")
+        
+        # Registration date
+        if seller.date_created:
+            reg_date = seller.date_created.strftime("%d.%m.%Y %H:%M")
+            user_info.append(f"• Дата регистрации: {reg_date}")
+        
+        # Get buyer groups and xPubs
+        buyer_groups = get_buyer_groups_by_seller(db, telegram_id)
+        
+        user_info.append("\n💳 **Кошельки (xPub):**")
+        if buyer_groups:
+            for group in buyer_groups:
+                if group.xpub:
+                    xpub_short = f"{group.xpub[:20]}...{group.xpub[-10:]}" if len(group.xpub) > 35 else group.xpub
+                    user_info.append(f"• Account {group.invoices_group}: `{xpub_short}`")
+                    if group.buyer_id:
+                        user_info.append(f"  └ Покупатель: {group.buyer_id}")
+                else:
+                    user_info.append(f"• Account {group.invoices_group}: ⚠️ xPub не настроен")
+        else:
+            user_info.append("• Нет настроенных кошельков")
+        
+        # Get wallets information
+        wallets = get_wallets_by_seller(db, telegram_id)
+        if wallets:
+            user_info.append("\n🔑 **Дополнительные кошельки:**")
+            for wallet in wallets:
+                if wallet.xpub:
+                    xpub_short = f"{wallet.xpub[:20]}...{wallet.xpub[-10:]}" if len(wallet.xpub) > 35 else wallet.xpub
+                    user_info.append(f"• Account {wallet.account}: `{xpub_short}`")
+                    if wallet.label:
+                        user_info.append(f"  └ Метка: {wallet.label}")
+        
+        # Get invoice statistics
+        invoices = get_invoices_by_seller(db, telegram_id)
+        total_invoices = len(invoices)
+        paid_invoices = len([inv for inv in invoices if inv.status == 'paid'])
+        pending_invoices = len([inv for inv in invoices if inv.status == 'pending'])
+        
+        user_info.append("\n📋 **Статистика инвойсов:**")
+        user_info.append(f"• Всего: {total_invoices}")
+        user_info.append(f"• Оплачено: {paid_invoices}")
+        user_info.append(f"• В ожидании: {pending_invoices}")
+        
+        # Gas station balance
+        user_info.append("\n⛽ **Газовый депозит:**")
+        user_info.append(f"• Баланс: {seller.gas_deposit_balance:.2f} TRX")
+        
+        response_text = "\n".join(user_info)
+        
+        await message.answer(
+            response_text,
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard(is_registered=True)
+        )
+        
+    except Exception as e:
+        logger.exception(f"Error in handle_myaccount for user {telegram_id}: {e}")
+        await message.answer(
+            "❌ Произошла ошибка при получении информации об аккаунте.",
+            reply_markup=get_main_menu_keyboard(is_registered=True)
+        )
+
+
 async def handle_register(message: types.Message, state: FSMContext = None):
     # Only handle /register command here
     logger.info(f"User {message.from_user.id} called /register")
@@ -115,50 +210,33 @@ async def handle_register(message: types.Message, state: FSMContext = None):
     if not seller:
         create_seller(db=db, telegram_id=telegram_id)
         await message.answer(
-            "Вы новый пользователь. Пожалуйста, отправьте ваш xPub (или напишите 'нет', чтобы получить инструкцию)."
+            "Вы новый пользователь. Пожалуйста, отправьте ваш xPub (или напишите 'нет', чтобы получить инструкцию).",
+            reply_markup=get_main_menu_keyboard(is_registered=False)
         )
         if state is not None:
             await state.set_state(RegisterFSM.get_xpub)
         return
 
-    # Check if seller has any xPub submitted (wallets with seller_id)
+    # Check if seller has any xPub submitted (wallets or buyer groups with xPub)
     wallets = get_wallets_by_seller(db, telegram_id)
-    has_xpub = any(w.xpub for w in wallets)
+    buyer_groups = get_buyer_groups_by_seller(db, telegram_id)
+    has_xpub = any(w.xpub for w in wallets) or any(g.xpub for g in buyer_groups)
 
-    if not has_xpub:
+    if has_xpub:
+        # User is already registered with xPub, redirect to myaccount
         await message.answer(
-            "У вас ещё не зарегистрирован ни один xPub. Пожалуйста, отправьте ваш xPub (или напишите 'нет', чтобы получить инструкцию)."
+            "✅ Вы уже зарегистрированы! Используйте /myaccount для просмотра информации об аккаунте.",
+            reply_markup=get_main_menu_keyboard(is_registered=True)
         )
-        if state is not None:
-            await state.set_state(RegisterFSM.get_xpub)
         return
 
-    if wallets:
-        kb = types.ReplyKeyboardMarkup(
-            keyboard=[
-                [types.KeyboardButton(text="Использовать существующий аккаунт")],
-                [types.KeyboardButton(text="Create new wallet (new seed phrase)")],
-            ],
-            resize_keyboard=True,
-        )
-        logger.info(
-            f"User {telegram_id} has wallets, prompting for registration choice."
-        )
-        try:
-            await message.answer(
-                "У вас уже есть зарегистрированные кошельки. Выберите действие:",
-                reply_markup=kb,
-            )
-            await state.set_state(RegisterFSM.choose_account_action)
-            logger.info(
-                f"FSM state set to choose_account_action for user {telegram_id}"
-            )
-        except Exception as e:
-            logger.error(f"Error in registration choice prompt: {e}")
-            await message.answer(
-                "Ошибка при обработке выбора. Попробуйте ещё раз или обратитесь к администратору."
-            )
-        return
+    # No xPub found, continue with registration
+    await message.answer(
+        "У вас ещё не зарегистрирован ни один xPub. Пожалуйста, отправьте ваш xPub (или напишите 'нет', чтобы получить инструкцию).",
+        reply_markup=get_main_menu_keyboard(is_registered=False)
+    )
+    if state is not None:
+        await state.set_state(RegisterFSM.get_xpub)
 
 
 # --- Registration FSM choice handlers ---
@@ -223,33 +301,22 @@ async def show_main_menu(message: types.Message, state: FSMContext = None):
     """
     Show the main actions keyboard to the user.
     """
-    kb = types.ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                types.KeyboardButton(text="/register"),
-                types.KeyboardButton(text="/deposit"),
-            ],
-            [
-                types.KeyboardButton(text="/balance"),
-                types.KeyboardButton(text="/create_invoice"),
-            ],
-            [
-                types.KeyboardButton(text="/buyers"),
-                types.KeyboardButton(text="/add_buyer"),
-            ],
-            [
-                types.KeyboardButton(text="/sweep"),
-                types.KeyboardButton(text="/invoices"),
-            ],
-        ],
-        resize_keyboard=True,
-    )
-    await message.answer("Вы вернулись в главное меню.", reply_markup=kb)
-    # Only prompt for xPub if explicitly required by registration flow, not after account selection
-    return
-
-    # # Non-FSM registration flow
-    # token = secrets.token_urlsafe(16)
+    telegram_id = message.from_user.id
+    db = message.bot.db
+    
+    # Check if user is registered
+    try:
+        seller = get_seller(db=db, telegram_id=telegram_id)
+        # Check if user has any xPub configured
+        wallets = get_wallets_by_seller(db, telegram_id)
+        buyer_groups = get_buyer_groups_by_seller(db, telegram_id)
+        has_xpub = any(w.xpub for w in wallets) or any(g.xpub for g in buyer_groups)
+        is_registered = seller is not None and has_xpub
+    except Exception:
+        is_registered = False
+    
+    keyboard = get_main_menu_keyboard(is_registered=is_registered)
+    await message.answer("Вы вернулись в главное меню.", reply_markup=keyboard)
     # seller = get_seller(db=db, telegram_id=telegram_id)
     # if not seller:
     #     create_seller(db=db, telegram_id=telegram_id)
