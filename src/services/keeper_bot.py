@@ -2,55 +2,6 @@
 
 import time
 import logging
-from tronpy import Tron
-from tronpy.providers import HTTPProvider
-
-# Import configuration
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from src.core.database.db_service import get_db, get_invoices_by_seller, get_invoice, update_invoice, create_transaction
-from src.core.database.models import Invoice
-from src.core.services.gas_station import auto_activate_on_usdt_receive
-from src.core.config import config
-
-# Setup logging
-logging.basicConfig(
-    level=getattr(logging, config.log_level),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(config.log_file, encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger("keeper_bot")
-
-class KeeperBot:
-    """Blockchain monitoring bot for invoice payments"""
-    
-    def __init__(self):
-        self.tron_config = config.tron
-        self.client = self._get_tron_client()
-        self.usdt_contract_address = self.tron_config.usdt_contract
-        logger.info("Keeper bot initialized for %s network", self.tron_config.network)
-        logger.info("USDT contract: %s", self.usdt_contract_address)
-    
-    def _get_tron_client(self) -> Tron:
-        """Create and configure TRON client"""
-        client_config = self.tron_config.get_tron_client_config()
-        
-        # Create provider with API key if available
-        if client_config.get("api_key"):
-            provider = HTTPProvider(
-                endpoint_uri=client_config["full_node"],
-                api_key=client_config["api_key"]
-            )
-            client = Tron(provider=provider)
-# Основной скрипт воркера для мониторинга блокчейна
-
-import time
-import logging
 from datetime import datetime
 from tronpy import Tron
 from tronpy.providers import HTTPProvider
@@ -58,7 +9,10 @@ from tronpy.providers import HTTPProvider
 # Import configuration
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Add project root to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, project_root)
 
 from src.core.database.db_service import get_db, get_invoices_by_seller, get_invoice, update_invoice, create_transaction
 from src.core.database.models import Invoice
@@ -144,6 +98,24 @@ class KeeperBot:
         
         return client
     
+    def _check_client_health(self) -> bool:
+        """Check if current client connection is healthy"""
+        try:
+            self.client.get_latest_block()
+            return True
+        except Exception as e:
+            logger.warning("Client health check failed: %s", e)
+            return False
+    
+    def _reconnect_if_needed(self):
+        """Reconnect if current client is unhealthy"""
+        if not self._check_client_health():
+            logger.info("Client connection unhealthy, attempting to reconnect...")
+            old_client = self.client
+            self.client = self._get_tron_client()
+            if self.client != old_client:
+                logger.info("Successfully reconnected to TRON network")
+    
     def notify_invoice_paid(self, invoice_id: int, tx_hash: str, amount: float):
         """Notify about paid invoice"""
         logger.info("Invoice %s paid: tx=%s, amount=%s", invoice_id, tx_hash, amount)
@@ -202,6 +174,8 @@ class KeeperBot:
             balance = balance / 1_000_000
         except Exception as e:
             logger.error("Error checking balance for %s: %s", address, e)
+            # Try to reconnect on balance check failure
+            self._reconnect_if_needed()
             return
 
         try:
@@ -209,6 +183,8 @@ class KeeperBot:
             not_activated = account_info is None
         except Exception as e:
             logger.error("Error checking TRX account for %s: %s", address, e)
+            # Try to reconnect on account check failure
+            self._reconnect_if_needed()
             not_activated = True
 
         if balance > 0:
@@ -249,16 +225,30 @@ class KeeperBot:
         logger.info("Keeper Bot started. Monitoring pending invoices...")
         logger.info("Check interval: %s seconds", check_interval)
         
+        connection_check_counter = 0
+        connection_check_interval = 10  # Check connection health every 10 cycles
+        
         while True:
             try:
+                # Periodically check and reconnect if needed
+                connection_check_counter += 1
+                if connection_check_counter >= connection_check_interval:
+                    self._reconnect_if_needed()
+                    connection_check_counter = 0
+                
                 self.check_pending_invoices()
                 time.sleep(check_interval)
             except KeyboardInterrupt:
                 logger.info("Keeper Bot stopped by user")
                 break
-            except Exception as e:
+            except (ConnectionError, ValueError, RuntimeError) as e:
                 logger.error("Unexpected error in keeper bot: %s", e)
                 logger.info("Continuing after error...")
+                # Reset connection on unexpected errors
+                try:
+                    self._reconnect_if_needed()
+                except (ConnectionError, ValueError, RuntimeError) as reconnect_error:
+                    logger.error("Failed to reconnect after error: %s", reconnect_error)
                 time.sleep(check_interval)
 
 # Legacy functions for backward compatibility
