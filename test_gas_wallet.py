@@ -37,8 +37,7 @@ def test_gas_wallet():
             # Try local first
             local_node = os.getenv('TRON_TESTNET_LOCAL_FULL_NODE', 'http://192.168.86.154:8090')
             try:
-                tron = Tron(network='nile')
-                tron.manager.session.base_url = local_node
+                tron = Tron(provider={'full_node': local_node})
                 print(f"🔗 Connected to local node: {local_node}")
             except Exception:
                 tron = Tron(network='nile')

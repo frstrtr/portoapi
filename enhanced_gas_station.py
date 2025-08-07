@@ -48,8 +48,7 @@ class ResourcePoolGasStation:
             
         # Get wallet account
         priv_key = PrivateKey(bytes.fromhex(self.private_key))
-        self.account = self.tron.generate_address_from_private_key(self.private_key)
-        self.address = self.account['base58check_address']
+        self.address = priv_key.public_key.to_base58check_address()
         
         print(f"💰 Gas Station Wallet: {self.address}")
         
@@ -111,8 +110,7 @@ class ResourcePoolGasStation:
             # Create freeze transaction
             txn = self.tron.trx.freeze_balance(
                 owner=self.address,
-                frozen_balance=amount_sun,
-                frozen_duration=3,  # Minimum 3 days
+                amount=amount_sun,
                 resource=resource_type
             ).build().sign(self.private_key)
             
