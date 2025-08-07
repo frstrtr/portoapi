@@ -131,9 +131,19 @@ async def main():
         log_and_handle(seller_handlers.handle_keeper_status, "/keeper_status"),
         lambda m: m.text == "/keeper_status",
     )
+    # Add alias without underscore for better UX
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_keeper_status, "/keeperstatus"),
+        lambda m: m.text == "/keeperstatus",
+    )
     dp.message.register(
         log_and_handle(seller_handlers.handle_keeper_logs, "/keeper_logs"),
         lambda m: m.text == "/keeper_logs",
+    )
+    # Add alias without underscore for better UX
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_keeper_logs, "/keeperlogs"),
+        lambda m: m.text == "/keeperlogs",
     )
     dp.message.register(
         log_and_handle(seller_handlers.handle_gasstation_stake, "/gasstation_stake"),
