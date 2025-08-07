@@ -1,8 +1,3 @@
-from src.bot.admin.admin_handlers import ADMINS
-import aiohttp
-from aiogram.exceptions import TelegramNetworkError
-from src.bot.admin.admin_handlers import handle_admin_xpubs
-
 # Main entrance point to start Telegram-bot
 
 import logging
@@ -11,6 +6,15 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import asyncio
 from dotenv import load_dotenv
 import os
+import sys
+
+# Add project root to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, project_root)
+
+from src.bot.admin.admin_handlers import ADMINS, handle_admin_xpubs
+import aiohttp
+from aiogram.exceptions import TelegramNetworkError
 from src.bot.handlers import seller_handlers, common_handlers
 from src.core.database.db_service import SessionLocal
 import functools
@@ -116,6 +120,32 @@ async def main():
     dp.message.register(
         log_and_handle(seller_handlers.handle_myaccount, "/myaccount"),
         lambda m: m.text == "/myaccount",
+    )
+    
+    # Register gas station and keeper bot handlers
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_gasstation, "/gasstation"),
+        lambda m: m.text == "/gasstation",
+    )
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_keeper_status, "/keeper_status"),
+        lambda m: m.text == "/keeper_status",
+    )
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_keeper_logs, "/keeper_logs"),
+        lambda m: m.text == "/keeper_logs",
+    )
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_gasstation_stake, "/gasstation_stake"),
+        lambda m: m.text == "/gasstation_stake",
+    )
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_gasstation_delegate, "/gasstation_delegate"),
+        lambda m: m.text == "/gasstation_delegate",
+    )
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_gasstation_withdraw, "/gasstation_withdraw"),
+        lambda m: m.text == "/gasstation_withdraw",
     )
     
     logger.info("Starting Telegram bot...")

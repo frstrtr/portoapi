@@ -6,7 +6,7 @@ Provides high-level interface for gas station operations
 import logging
 from typing import Dict, Optional, Tuple
 from .gas_station_service import GasStationService
-from ..config import TronConfig
+from src.core.config import config
 
 logger = logging.getLogger(__name__)
 
@@ -17,12 +17,12 @@ class GasStationManager:
     Integrates with PortoAPI configuration and provides business logic
     """
     
-    def __init__(self, config: TronConfig):
+    def __init__(self, tron_config=None):
         """Initialize with PortoAPI configuration"""
-        self.config = config
-        self.gas_station = GasStationService(config)
+        self.config = tron_config or config.tron
+        self.gas_station = GasStationService(self.config)
         
-        logger.info(f"Gas Station Manager initialized for {config.network}")
+        logger.info(f"Gas Station Manager initialized for {self.config.network}")
     
     def get_gas_wallet_address(self) -> str:
         """Get the gas station wallet address"""

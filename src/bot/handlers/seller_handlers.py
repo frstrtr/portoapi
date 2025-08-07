@@ -36,6 +36,15 @@ from src.core.services.gas_station import (
     prepare_for_sweep,
 )
 
+# Import new gas station module
+from src.core.services.gasstation import (
+    GasStationService,
+    GasStationManager,
+    format_resource_status,
+    analyze_resource_needs,
+    calculate_staking_efficiency,
+)
+
 
 # pylint: disable=logging-fstring-interpolation
 
@@ -66,6 +75,8 @@ MAIN_COMMANDS = [
     "/add_buyer",
     "/sweep",
     "/invoices",
+    "/gasstation",
+    "/keeper_status",
 ]
 
 
@@ -109,17 +120,17 @@ async def handle_myaccount(message: types.Message):
     """Show detailed account information for registered users"""
     telegram_id = message.from_user.id
     db = message.bot.db
-    
+
     try:
         # Get seller information
         seller = get_seller(db=db, telegram_id=telegram_id)
         if not seller:
             await message.answer(
                 "❌ Вы не зарегистрированы. Используйте /register для регистрации.",
-                reply_markup=get_main_menu_keyboard(is_registered=False)
+                reply_markup=get_main_menu_keyboard(is_registered=False),
             )
             return
-        
+
         # Get user info from Telegram
         user = message.from_user
         user_info = []
@@ -132,67 +143,79 @@ async def handle_myaccount(message: types.Message):
             user_info.append(f"• Username: @{user.username}")
         else:
             user_info.append("• Username: Не указан")
-        
+
         # Registration date
         if seller.date_created:
             reg_date = seller.date_created.strftime("%d.%m.%Y %H:%M")
             user_info.append(f"• Дата регистрации: {reg_date}")
-        
+
         # Get buyer groups and xPubs
         buyer_groups = get_buyer_groups_by_seller(db, telegram_id)
-        
+
         user_info.append("\n💳 **Кошельки (xPub):**")
         if buyer_groups:
             for group in buyer_groups:
                 if group.xpub:
-                    xpub_short = f"{group.xpub[:20]}...{group.xpub[-10:]}" if len(group.xpub) > 35 else group.xpub
-                    user_info.append(f"• Account {group.invoices_group}: `{xpub_short}`")
+                    xpub_short = (
+                        f"{group.xpub[:20]}...{group.xpub[-10:]}"
+                        if len(group.xpub) > 35
+                        else group.xpub
+                    )
+                    user_info.append(
+                        f"• Account {group.invoices_group}: `{xpub_short}`"
+                    )
                     if group.buyer_id:
                         user_info.append(f"  └ Покупатель: {group.buyer_id}")
                 else:
-                    user_info.append(f"• Account {group.invoices_group}: ⚠️ xPub не настроен")
+                    user_info.append(
+                        f"• Account {group.invoices_group}: ⚠️ xPub не настроен"
+                    )
         else:
             user_info.append("• Нет настроенных кошельков")
-        
+
         # Get wallets information
         wallets = get_wallets_by_seller(db, telegram_id)
         if wallets:
             user_info.append("\n🔑 **Дополнительные кошельки:**")
             for wallet in wallets:
                 if wallet.xpub:
-                    xpub_short = f"{wallet.xpub[:20]}...{wallet.xpub[-10:]}" if len(wallet.xpub) > 35 else wallet.xpub
+                    xpub_short = (
+                        f"{wallet.xpub[:20]}...{wallet.xpub[-10:]}"
+                        if len(wallet.xpub) > 35
+                        else wallet.xpub
+                    )
                     user_info.append(f"• Account {wallet.account}: `{xpub_short}`")
                     if wallet.label:
                         user_info.append(f"  └ Метка: {wallet.label}")
-        
+
         # Get invoice statistics
         invoices = get_invoices_by_seller(db, telegram_id)
         total_invoices = len(invoices)
-        paid_invoices = len([inv for inv in invoices if inv.status == 'paid'])
-        pending_invoices = len([inv for inv in invoices if inv.status == 'pending'])
-        
+        paid_invoices = len([inv for inv in invoices if inv.status == "paid"])
+        pending_invoices = len([inv for inv in invoices if inv.status == "pending"])
+
         user_info.append("\n📋 **Статистика инвойсов:**")
         user_info.append(f"• Всего: {total_invoices}")
         user_info.append(f"• Оплачено: {paid_invoices}")
         user_info.append(f"• В ожидании: {pending_invoices}")
-        
+
         # Gas station balance
         user_info.append("\n⛽ **Газовый депозит:**")
         user_info.append(f"• Баланс: {seller.gas_deposit_balance:.2f} TRX")
-        
+
         response_text = "\n".join(user_info)
-        
+
         await message.answer(
             response_text,
             parse_mode="Markdown",
-            reply_markup=get_main_menu_keyboard(is_registered=True)
+            reply_markup=get_main_menu_keyboard(is_registered=True),
         )
-        
+
     except Exception as e:
         logger.exception(f"Error in handle_myaccount for user {telegram_id}: {e}")
         await message.answer(
             "❌ Произошла ошибка при получении информации об аккаунте.",
-            reply_markup=get_main_menu_keyboard(is_registered=True)
+            reply_markup=get_main_menu_keyboard(is_registered=True),
         )
 
 
@@ -211,7 +234,7 @@ async def handle_register(message: types.Message, state: FSMContext = None):
         create_seller(db=db, telegram_id=telegram_id)
         await message.answer(
             "Вы новый пользователь. Пожалуйста, отправьте ваш xPub (или напишите 'нет', чтобы получить инструкцию).",
-            reply_markup=get_main_menu_keyboard(is_registered=False)
+            reply_markup=get_main_menu_keyboard(is_registered=False),
         )
         if state is not None:
             await state.set_state(RegisterFSM.get_xpub)
@@ -226,14 +249,14 @@ async def handle_register(message: types.Message, state: FSMContext = None):
         # User is already registered with xPub, redirect to myaccount
         await message.answer(
             "✅ Вы уже зарегистрированы! Используйте /myaccount для просмотра информации об аккаунте.",
-            reply_markup=get_main_menu_keyboard(is_registered=True)
+            reply_markup=get_main_menu_keyboard(is_registered=True),
         )
         return
 
     # No xPub found, continue with registration
     await message.answer(
         "У вас ещё не зарегистрирован ни один xPub. Пожалуйста, отправьте ваш xPub (или напишите 'нет', чтобы получить инструкцию).",
-        reply_markup=get_main_menu_keyboard(is_registered=False)
+        reply_markup=get_main_menu_keyboard(is_registered=False),
     )
     if state is not None:
         await state.set_state(RegisterFSM.get_xpub)
@@ -303,7 +326,7 @@ async def show_main_menu(message: types.Message, state: FSMContext = None):
     """
     telegram_id = message.from_user.id
     db = message.bot.db
-    
+
     # Check if user is registered
     try:
         seller = get_seller(db=db, telegram_id=telegram_id)
@@ -314,7 +337,7 @@ async def show_main_menu(message: types.Message, state: FSMContext = None):
         is_registered = seller is not None and has_xpub
     except Exception:
         is_registered = False
-    
+
     keyboard = get_main_menu_keyboard(is_registered=is_registered)
     await message.answer("Вы вернулись в главное меню.", reply_markup=keyboard)
     # seller = get_seller(db=db, telegram_id=telegram_id)
@@ -847,6 +870,223 @@ def register_registration_fsm_handlers(dp, seller_handlers):
 
 def register_help_handler(dp, seller_handlers):
     dp.message.register(seller_handlers.handle_help, commands=["help"])
+
+
+# Gas Station and Keeper Bot handlers
+async def handle_gasstation(message: types.Message):
+    """Handle gas station status and management"""
+    try:
+        # Use the same configuration as other services
+        from src.core.config import config
+        
+        # Send initial message to show it's processing
+        processing_msg = await message.answer("⏳ Getting gas station status...")
+        
+        gas_station = GasStationService(config.tron)
+
+        # Get gas station status with timeout handling
+        import asyncio
+        try:
+            # Run with a timeout to prevent hanging
+            status = await asyncio.wait_for(
+                asyncio.to_thread(gas_station.get_status), 
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            await processing_msg.delete()
+            await message.answer("❌ Gas station request timed out. TRON network connection might be slow. Please try again.")
+            return
+
+        # Format the response
+        response = "⛽ **Gas Station Status**\n\n"
+        response += f"🏦 **Address:** `{status['address']}`\n"
+        response += f"💰 **TRX Balance:** {status['balance']:.2f} TRX\n\n"
+
+        response += "📊 **Staked Resources:**\n"
+        if status["resources"]["energy"]["staked"] > 0:
+            response += f"⚡ **Energy:** {status['resources']['energy']['staked']:,.0f} TRX\n"
+            response += (
+                f"   Available: {status['resources']['energy']['available']:,} units\n"
+            )
+
+        if status["resources"]["bandwidth"]["staked"] > 0:
+            response += f"📡 **Bandwidth:** {status['resources']['bandwidth']['staked']:,.0f} TRX\n"
+            response += f"   Available: {status['resources']['bandwidth']['available']:,} units\n"
+
+        response += f"\n🔗 **Network:** {status['network']}\n"
+        response += f"✅ **Status:** {'Online' if status.get('operational', {}).get('can_process_100_tx', False) else 'Offline'}\n"
+
+        # Add efficiency analysis
+        try:
+            # Use the efficiency data already calculated in the status
+            energy_eff = status.get("efficiency", {}).get("energy", 0)
+            bandwidth_eff = status.get("efficiency", {}).get("bandwidth", 0)
+            avg_efficiency = (energy_eff + bandwidth_eff) / 2 if energy_eff or bandwidth_eff else 0
+            response += f"\n📈 **Efficiency:** {avg_efficiency:.1f}%\n"
+        except Exception:
+            response += f"\n📈 **Efficiency:** Not available\n"
+
+        # Add management buttons
+        response += "\n🔧 **Management Commands:**\n"
+        response += "• `/gasstation_stake` - Manage staking\n"
+        response += "• `/gasstation_delegate` - Manage delegation\n"
+        response += "• `/gasstation_withdraw` - Withdraw resources\n"
+
+        # Delete processing message and send result
+        await processing_msg.delete()
+        await message.answer(response, parse_mode="Markdown")
+
+    except ValueError as ve:
+        logger.error(f"Configuration error in gas station handler: {ve}")
+        if 'processing_msg' in locals():
+            await processing_msg.delete()
+        await message.answer("❌ Gas station configuration error. Please check if the gas wallet private key is set correctly.")
+    except Exception as e:
+        logger.error(f"Error in gas station handler: {e}")
+        if 'processing_msg' in locals():
+            await processing_msg.delete()
+        await message.answer(
+            "❌ Error retrieving gas station status. The service might be connecting to TRON network. Please try again in a moment."
+        )
+
+
+async def handle_keeper_status(message: types.Message):
+    """Handle keeper bot status monitoring"""
+    try:
+        # Check if keeper bot process is running by checking log activity
+        import subprocess
+        import os
+
+        keeper_running = False
+
+        # Try to check if process is running via ps command (Linux/Unix)
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "keeper_bot.py"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            keeper_running = bool(result.stdout.strip())
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            # Fallback: check recent log activity
+            try:
+                import time
+
+                with open("bot.log", "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                    keeper_logs = [line for line in lines[-20:] if "keeper_bot" in line]
+                    if keeper_logs:
+                        # Check if last log is recent (within last 5 minutes)
+                        last_log = keeper_logs[-1]
+                        # This is a simple heuristic - if we see recent logs, assume it's running
+                        keeper_running = True
+            except Exception:
+                pass
+
+        response = "🤖 **Keeper Bot Status**\n\n"
+
+        if keeper_running:
+            response += "✅ **Status:** Running\n"
+
+            # Try to get recent log entries
+            try:
+                with open("bot.log", "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                    keeper_logs = [line for line in lines[-50:] if "keeper_bot" in line]
+                    if keeper_logs:
+                        last_log = keeper_logs[-1].strip()
+                        # Extract timestamp and message
+                        if "Checking pending invoices" in last_log:
+                            response += "🔍 **Last Activity:** Checking invoices\n"
+                        elif "Invoice" in last_log and "paid" in last_log:
+                            response += (
+                                "💰 **Last Activity:** Invoice payment detected\n"
+                            )
+                        elif "connected to local TRON node" in last_log:
+                            response += (
+                                "🔗 **Last Activity:** Connected to local node\n"
+                            )
+                        elif "connected to remote TRON" in last_log:
+                            response += (
+                                "🌐 **Last Activity:** Connected to remote API\n"
+                            )
+                        else:
+                            response += "📝 **Last Activity:** Processing...\n"
+            except Exception:
+                pass
+
+        else:
+            response += "❌ **Status:** Not Running\n"
+            response += "ℹ️ The keeper bot monitors pending invoices and handles automatic account activation.\n"
+
+        response += "\n📊 **Functions:**\n"
+        response += "• Monitor pending invoice payments\n"
+        response += "• Auto-activate TRON accounts\n"
+        response += "• Handle USDT transfer detection\n"
+        response += "• Manage payment notifications\n"
+        response += "• Local TRON node support with fallback\n"
+
+        if keeper_running:
+            response += "\n🔧 **Management:**\n"
+            response += "• `/keeper_logs` - View recent logs\n"
+
+        await message.answer(response, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Error in keeper status handler: {e}")
+        await message.answer(
+            "❌ Error retrieving keeper bot status. Please try again later."
+        )
+
+
+async def handle_keeper_logs(message: types.Message):
+    """Show recent keeper bot logs"""
+    try:
+        with open("bot.log", "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            keeper_logs = [line for line in lines[-100:] if "keeper_bot" in line]
+
+        if not keeper_logs:
+            await message.answer("📝 No recent keeper bot logs found.")
+            return
+
+        # Get last 10 log entries
+        recent_logs = keeper_logs[-10:]
+
+        response = "📋 **Recent Keeper Bot Logs:**\n\n"
+        for log in recent_logs:
+            # Clean up the log line for display
+            clean_log = log.strip()
+            if len(clean_log) > 100:
+                clean_log = clean_log[:97] + "..."
+            response += f"`{clean_log}`\n"
+
+        response += f"\n📊 **Total entries:** {len(keeper_logs)}"
+
+        await message.answer(response, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Error reading keeper logs: {e}")
+        await message.answer("❌ Error reading keeper bot logs.")
+
+
+async def handle_gasstation_stake(message: types.Message):
+    """Handle gas station staking management"""
+    # TODO: Implement staking management interface
+    await message.answer("🚧 Gas station staking management coming soon!")
+
+
+async def handle_gasstation_delegate(message: types.Message):
+    """Handle gas station delegation management"""
+    # TODO: Implement delegation management interface
+    await message.answer("🚧 Gas station delegation management coming soon!")
+
+
+async def handle_gasstation_withdraw(message: types.Message):
+    """Handle gas station withdrawal management"""
+    # TODO: Implement withdrawal management interface
+    await message.answer("🚧 Gas station withdrawal management coming soon!")
 
 
 # Handler to cancel FSM state if main command is sent during an active FSM flow
