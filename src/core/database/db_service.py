@@ -1,9 +1,17 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from .models import Seller, Invoice, Transaction, Wallet, GasStation
+from src.core.database.models import (
+    Seller,
+    Invoice,
+    Transaction,
+    Wallet,
+    GasStation,
+    BuyerGroup,
+    Base,
+)
 import os
 import logging
-from .models import BuyerGroup
+from typing import Optional
 
 
 logger = logging.getLogger(__name__)
@@ -15,9 +23,32 @@ DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'data', 'database.sqlite3')}"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-logger.info(f"Full DATABASE_URL: {DATABASE_URL}")
+logger.info("Full DATABASE_URL: %s", DATABASE_URL)
 DB_PATH = DATABASE_URL.replace("sqlite:///", "")
-logger.info(f"Resolved DB_PATH: {DB_PATH}")
+logger.info("Resolved DB_PATH: %s", DB_PATH)
+
+
+def init_db() -> Optional[str]:
+    """Initialize the SQLite database on first run.
+    - Ensures the data directory exists
+    - Creates all tables defined in models.Base
+    Returns the DB path or None on failure.
+    """
+    try:
+        data_dir = os.path.dirname(DB_PATH)
+        if data_dir and not os.path.exists(data_dir):
+            os.makedirs(data_dir, exist_ok=True)
+            logger.info("Created data directory: %s", data_dir)
+        Base.metadata.create_all(bind=engine)
+        logger.info("Database initialized (tables ensured)")
+        return DB_PATH
+    except Exception as e:
+        logger.error("Failed to initialize database: %s", e)
+        return None
+
+
+# Ensure DB exists when this module is imported
+init_db()
 
 
 # --- BUYER GROUPS CRUD ---

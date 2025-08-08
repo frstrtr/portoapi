@@ -6,6 +6,7 @@ from aiogram.fsm.context import FSMContext
 import logging
 import secrets
 from io import BytesIO
+import html
 
 import qrcode
 
@@ -27,6 +28,7 @@ from src.core.database.db_service import (
     get_wallets_by_seller,
     create_seller_wallet,
     update_seller,
+    get_transactions_by_invoice,
 )
 
 from src.core.crypto.xpub_validation import is_valid_xpub
@@ -134,13 +136,14 @@ async def handle_myaccount(message: types.Message):
         # Get user info from Telegram
         user = message.from_user
         user_info = []
-        user_info.append("👤 **Информация о пользователе:**")
-        user_info.append(f"• ID: `{user.id}`")
-        user_info.append(f"• Имя: {user.first_name or 'Не указано'}")
+        user_info.append("👤 <b>Информация о пользователе:</b>")
+        user_info.append(f"• ID: <code>{user.id}</code>")
+        fn = html.escape(user.first_name) if user.first_name else "Не указано"
+        user_info.append(f"• Имя: {fn}")
         if user.last_name:
-            user_info.append(f"• Фамилия: {user.last_name}")
+            user_info.append(f"• Фамилия: {html.escape(user.last_name)}")
         if user.username:
-            user_info.append(f"• Username: @{user.username}")
+            user_info.append(f"• Username: @{html.escape(user.username)}")
         else:
             user_info.append("• Username: Не указан")
 
@@ -152,20 +155,21 @@ async def handle_myaccount(message: types.Message):
         # Get buyer groups and xPubs
         buyer_groups = get_buyer_groups_by_seller(db, telegram_id)
 
-        user_info.append("\n💳 **Кошельки (xPub):**")
+        user_info.append("\n💳 <b>Кошельки (xPub):</b>")
         if buyer_groups:
             for group in buyer_groups:
                 if group.xpub:
                     xpub_short = (
                         f"{group.xpub[:20]}...{group.xpub[-10:]}"
+
                         if len(group.xpub) > 35
                         else group.xpub
                     )
                     user_info.append(
-                        f"• Account {group.invoices_group}: `{xpub_short}`"
+                        f"• Account {group.invoices_group}: <code>{html.escape(xpub_short)}</code>"
                     )
                     if group.buyer_id:
-                        user_info.append(f"  └ Покупатель: {group.buyer_id}")
+                        user_info.append(f"  └ Покупатель: {html.escape(group.buyer_id)}")
                 else:
                     user_info.append(
                         f"• Account {group.invoices_group}: ⚠️ xPub не настроен"
@@ -176,38 +180,62 @@ async def handle_myaccount(message: types.Message):
         # Get wallets information
         wallets = get_wallets_by_seller(db, telegram_id)
         if wallets:
-            user_info.append("\n🔑 **Дополнительные кошельки:**")
+            user_info.append("\n🔑 <b>Дополнительные кошельки:</b>")
             for wallet in wallets:
                 if wallet.xpub:
                     xpub_short = (
                         f"{wallet.xpub[:20]}...{wallet.xpub[-10:]}"
+
                         if len(wallet.xpub) > 35
                         else wallet.xpub
                     )
-                    user_info.append(f"• Account {wallet.account}: `{xpub_short}`")
+                    derivation_path = getattr(wallet, 'derivation_path', None) or "—"
+                    deposit_type = getattr(wallet, 'deposit_type', None)
+                    line = f"• Account {wallet.account} (path: {html.escape(derivation_path)})"
+                    if deposit_type:
+                        line += f" [{deposit_type}]"
+                    line += f": <code>{html.escape(xpub_short)}</code>"
+                    user_info.append(line)
                     if wallet.label:
-                        user_info.append(f"  └ Метка: {wallet.label}")
+                        user_info.append(f"  └ Метка: {html.escape(wallet.label)}")
 
         # Get invoice statistics
         invoices = get_invoices_by_seller(db, telegram_id)
         total_invoices = len(invoices)
         paid_invoices = len([inv for inv in invoices if inv.status == "paid"])
         pending_invoices = len([inv for inv in invoices if inv.status == "pending"])
+        partial_invoices = len([inv for inv in invoices if inv.status == "partial"])
 
-        user_info.append("\n📋 **Статистика инвойсов:**")
+        user_info.append("\n📋 <b>Статистика инвойсов:</b>")
         user_info.append(f"• Всего: {total_invoices}")
         user_info.append(f"• Оплачено: {paid_invoices}")
+        user_info.append(f"• Частично оплачено: {partial_invoices}")
         user_info.append(f"• В ожидании: {pending_invoices}")
 
+        # Details for partially paid invoices
+        if partial_invoices:
+            user_info.append("\n🟡 <b>Частично оплаченные инвойсы:</b>")
+            for inv in [i for i in invoices if i.status == 'partial']:
+                try:
+                    txs = get_transactions_by_invoice(db, inv.id)
+                    total_received = sum(float(t.amount_received or 0) for t in txs)
+                except Exception:
+                    total_received = 0.0
+                remaining = max(0.0, float(inv.amount) - total_received)
+                addr_short = html.escape(inv.address[:8] + '...' + inv.address[-6:]) if inv.address and len(inv.address) > 15 else html.escape(getattr(inv, 'address', ''))
+                user_info.append(
+                    f"• #{inv.id} {total_received:.2f}/{float(inv.amount):.2f} USDT (осталось {remaining:.2f}) <code>{addr_short}</code>"
+                )
+
         # Gas station balance
-        user_info.append("\n⛽ **Газовый депозит:**")
+        user_info.append("\n⛽ <b>Газовый депозит:</b>")
         user_info.append(f"• Баланс: {seller.gas_deposit_balance:.2f} TRX")
 
         response_text = "\n".join(user_info)
 
         await message.answer(
             response_text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=get_main_menu_keyboard(is_registered=True),
         )
 
@@ -388,9 +416,39 @@ async def handle_deposit(message: types.Message):
 async def handle_balance(message: types.Message):
     telegram_id = message.from_user.id
     logger.info(f"User {telegram_id} called /balance")
-    seller = get_seller(db=message.bot.db, telegram_id=telegram_id)
-    logger.info(f"User {telegram_id} balance: {seller.gas_deposit_balance} TRX")
-    await message.answer(f"Ваш баланс: {seller.gas_deposit_balance} TRX")
+    db = message.bot.db
+    seller = get_seller(db=db, telegram_id=telegram_id)
+
+    # Default credited balance from DB
+    credited_trx = float(seller.gas_deposit_balance or 0)
+
+    # Resolve deposit address and on-chain pending balance
+    pending_trx = 0.0
+    try:
+        from src.core.config import config
+        # Ensure a deposit address exists
+        deposit_address = get_or_create_tron_deposit_address(db, seller_id=telegram_id)
+        # Query TRX balance on-chain via GasStationService's client
+        gs = GasStationService(config.tron)
+        acc_info = gs.tron.get_account(deposit_address)
+        sun = int((acc_info or {}).get('balance', 0) or 0)
+        pending_trx = sun / 1_000_000
+    except Exception as e:
+        logger.warning(f"Could not fetch on-chain TRX balance for {telegram_id}: {e}")
+        deposit_address = deposit_address if 'deposit_address' in locals() else 'N/A'
+
+    logger.info(
+        f"User {telegram_id} balance: credited={credited_trx} TRX, pending_onchain={pending_trx} TRX"
+    )
+
+    # Build user-friendly response
+    text = (
+        f"Ваш баланс: <b>{credited_trx:.6f} TRX</b>\n"
+        f"Ожидает зачисления на адрес депозита: <b>{pending_trx:.6f} TRX</b>\n\n"
+        f"Адрес депозита TRX: <code>{deposit_address}</code>\n"
+        f"Средства на адресе будут автоматически переведены на горячий кошелек и зачислены."
+    )
+    await message.answer(text, parse_mode="HTML")
 
 
 async def handle_create_invoice(message: types.Message, state: FSMContext):
@@ -765,10 +823,22 @@ async def handle_invoices(message: types.Message):
             if account_index != "-" and address_index != "-"
             else "-"
         )
+        # Calculate received/remaining via stored transactions
+        try:
+            txs = get_transactions_by_invoice(db, inv.id)
+            total_received = sum(float(t.amount_received or 0) for t in txs)
+        except Exception:
+            total_received = 0.0
+        remaining = max(0.0, float(inv.amount) - total_received)
+        received_line = (
+            f"Получено: {total_received:.6f} USDT\nОсталось: {remaining:.6f} USDT\n"
+            if total_received > 0 else ""
+        )
         text += (
             f"\nID: {inv.id}\n"
             f"Статус: {inv.status}\n"
             f"Сумма: {inv.amount}\n"
+            f"{received_line}"
             f"Адрес: {inv.address}\n"
             f"Группа покупателя: {buyer_id}\n"
             f"Индекс деривации: {address_index}\n"

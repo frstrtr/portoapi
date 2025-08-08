@@ -1,12 +1,11 @@
-# API package init
+"""
+API package
+Keep this lightweight to avoid side-effects when importing submodules.
+The FastAPI application is defined in `src/api/v1/main.py`.
+"""
 
+# Intentionally do not import endpoints or create an app here.
+# This prevents `import src.api.v1.main` from executing heavy imports at the
+# package level which can fail if environment (PYTHONPATH) isn't prepared yet.
 
-from fastapi import FastAPI
-from .v1.endpoints import register, invoices, gas_station, sweep
-
-app = FastAPI()
-
-app.include_router(register.router, prefix="/api/v1")
-app.include_router(invoices.router, prefix="/api/v1")
-app.include_router(gas_station.router, prefix="/api/v1")
-app.include_router(sweep.router, prefix="/api/v1")
+__all__ = []

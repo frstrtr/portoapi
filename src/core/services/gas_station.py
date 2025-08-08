@@ -2,6 +2,7 @@
 
 from tronpy import Tron
 from tronpy.providers import HTTPProvider
+from tronpy.keys import PrivateKey
 import time
 import logging
 from src.core.database.db_service import get_seller_wallet, create_seller_wallet
@@ -318,7 +319,7 @@ class GasStationManager:
         if account is None:
             account = seller_id
 
-        # Use xpub if provided, else derive from gas station mnemonic/seed
+        # Use xpub if provided, else derive from gas station mnemonic/seed or private key
         if xpub:
             # Derive address from xpub using bip_utils
             pub_ctx = Bip44.FromExtendedKey(xpub, Bip44Coins.TRON)
@@ -326,18 +327,27 @@ class GasStationManager:
             address = pub_ctx.Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
             path = f"m/44'/195'/{account}'/0/0"
         else:
-            # For admin/gas wallet, use mnemonic from config
-            if not self.tron_config.gas_wallet_mnemonic:
-                raise ValueError("GAS_WALLET_MNEMONIC not configured!")
-            
-            seed_bytes = Bip39SeedGenerator(self.tron_config.gas_wallet_mnemonic).Generate()
-            bip44_ctx = Bip44.FromSeed(seed_bytes, Bip44Coins.TRON)
-            account_ctx = bip44_ctx.Purpose().Coin().Account(account)
-            # Get xpub for storage if needed
-            xpub = account_ctx.PublicKey().ToExtended()
-            # Derive address for deposit
-            address = account_ctx.Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
-            path = f"m/44'/195'/{account}'/0/0"
+            # Prefer mnemonic if available, otherwise fallback to private key
+            if self.tron_config.gas_wallet_mnemonic:
+                seed_bytes = Bip39SeedGenerator(self.tron_config.gas_wallet_mnemonic).Generate()
+                bip44_ctx = Bip44.FromSeed(seed_bytes, Bip44Coins.TRON)
+                account_ctx = bip44_ctx.Purpose().Coin().Account(account)
+                # Get xpub for storage if needed
+                xpub = account_ctx.PublicKey().ToExtended()
+                # Derive address for deposit
+                address = account_ctx.Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
+                path = f"m/44'/195'/{account}'/0/0"
+            elif self.tron_config.gas_wallet_private_key:
+                # Derive a deposit address directly from the configured private key
+                try:
+                    pk = PrivateKey(bytes.fromhex(self.tron_config.gas_wallet_private_key))
+                    address = pk.public_key.to_base58check_address()
+                    path = "m/privkey"
+                    xpub = None
+                except Exception as e:
+                    raise ValueError("Invalid GAS_WALLET_PRIVATE_KEY") from e
+            else:
+                raise ValueError("GAS wallet credentials not configured (mnemonic or private key).")
 
         # 3. Save to DB
         create_seller_wallet(

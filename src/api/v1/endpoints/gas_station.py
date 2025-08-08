@@ -1,15 +1,15 @@
-
 # Эндпоинты для управления газовым депозитом
-from fastapi import APIRouter, HTTPException, status, Depends, Body
+from fastapi import APIRouter, HTTPException, status, Depends, Query
 from sqlalchemy.orm import Session
-from core.database.db_service import get_db
+from src.core.database.db_service import get_db
+from src.core.database.models import Seller
 
-from core.database.models import Seller, Invoice
+router = APIRouter()
 
 # --- GET /deposit/address ---
 @router.get("/deposit/address")
 def get_deposit_address(
-    telegram_id: int = Body(..., embed=True)
+    telegram_id: int = Query(..., description="Seller telegram id")
 ):
     """
     Возвращает адрес для пополнения газового депозита и memo (telegram_id).
@@ -21,7 +21,7 @@ def get_deposit_address(
 # --- GET /deposit/balance ---
 @router.get("/deposit/balance")
 def get_deposit_balance(
-    telegram_id: int = Body(..., embed=True),
+    telegram_id: int = Query(..., description="Seller telegram id"),
     db: Session = Depends(get_db)
 ):
     """

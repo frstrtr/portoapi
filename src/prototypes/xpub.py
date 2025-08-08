@@ -3,20 +3,28 @@ using a BIP39 mnemonic. It derives the first address and allows generating
 additional addresses from the xPub.
 """
 
-from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
+from bip_utils import (
+    Bip39SeedGenerator,
+    Bip44,
+    Bip44Coins,
+    Bip44Changes,
+    Bip39MnemonicGenerator,
+    Bip39WordsNum,
+)
 
-# Ask user for mnemonic, use default if empty
-default_mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+# Ask user for mnemonic; if empty, generate a new 12-word mnemonic
 mnemonic = input(
-    "Enter BIP39 mnemonic 12 or 24 words (leave empty for default): "
+    "Enter BIP39 mnemonic 12 or 24 words (leave empty to generate new): "
 ).strip()
 if not mnemonic:
-    mnemonic = default_mnemonic
+    mnemonic = Bip39MnemonicGenerator().FromWordsNumber(Bip39WordsNum.WORDS_NUM_12)
+    print("Generated new 12-word mnemonic (save it securely):")
+    print(mnemonic)
+else:
+    print(f"Using mnemonic: {mnemonic}")
 
-print(f"Using mnemonic: {mnemonic}")
 
-
-def derive_private_key_from_xprv(account_idx=0):
+def derive_private_key_from_xprv(acct_idx: int = 0):
     """
     Derives and prints the private key for the given account and address index using the current mnemonic.
     """
@@ -26,22 +34,16 @@ def derive_private_key_from_xprv(account_idx=0):
         change = Bip44Changes.CHAIN_EXT
         seed = Bip39SeedGenerator(mnemonic).Generate()
         ctx = Bip44.FromSeed(seed, Bip44Coins.TRON)
-        account_ctx = ctx.Purpose().Coin().Account(account_idx)
-        xprv = account_ctx.PrivateKey().ToExtended()
-        print(f"xprv for m/44'/195'/{account_idx}' : {xprv}")
-        priv_ctx = account_ctx.Change(change).AddressIndex(addr_idx)
+        acct_ctx_local = ctx.Purpose().Coin().Account(acct_idx)
+        xprv = acct_ctx_local.PrivateKey().ToExtended()
+        print(f"xprv for m/44'/195'/{acct_idx}' : {xprv}")
+        priv_ctx = acct_ctx_local.Change(change).AddressIndex(addr_idx)
         privkey = priv_ctx.PrivateKey().Raw().ToHex()
         address = priv_ctx.PublicKey().ToAddress()
         print(f"Address: {address}")
-        print(f"Private key for m/44'/195'/{account_idx}'/0/{addr_idx}: {privkey}")
-    except Exception as e:
+        print(f"Private key for m/44'/195'/{acct_idx}'/0/{addr_idx}: {privkey}")
+    except ValueError as e:
         print(f"Error: {e}")
-
-
-"""This script generates a Tron xPub (extended public key) and addresses
-using a BIP39 mnemonic. It derives the first address and allows generating
-additional addresses from the xPub.
-"""
 
 
 # Generate seed from mnemonic
@@ -63,7 +65,7 @@ except ValueError:
 # Derive account context and export account-level xpub
 account_ctx = coin_ctx.Account(account_idx)
 xpub = account_ctx.PublicKey().ToExtended()
-print(f"Tron ACCOUNT xpub (m/44'/195'/{account_idx}'): {xpub}")
+print(f"Tron ACCOUNT xpub (m/44'/195'/{account_idx}'):\n{xpub}")
 
 # Ask user how many addresses to generate
 try:
