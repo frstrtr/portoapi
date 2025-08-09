@@ -106,6 +106,11 @@ class RegisterFSM(StatesGroup):
     ask_address = State()
 
 
+# FSM для /sweep выбора режима
+class SweepFSM(StatesGroup):
+    choose_mode = State()  # пользователь выбирает что именно вывести
+
+
 async def handle_main_command_interrupt(message: types.Message, state: FSMContext):
     telegram_id = message.from_user.id
     logger.info(
@@ -679,7 +684,26 @@ async def process_add_buyer_xpub(message: types.Message, state: FSMContext):
     telegram_id = message.from_user.id
     data = await state.get_data()
     buyer_id = data.get("buyer_id")
-    xpub = message.text.strip()
+    xpub_text = message.text.strip()
+
+    # Allow user to cancel
+    if xpub_text.lower() in {"/cancel", "отмена", "cancel"}:
+        await message.answer("Операция добавления покупателя отменена.")
+        await state.clear()
+        return
+
+    if not buyer_id:
+        await message.answer("Контекст утерян. Пожалуйста, начните сначала: /add_buyer")
+        await state.clear()
+        return
+
+    # Validate xPub format strictly to avoid accepting other keyboard texts
+    if not is_valid_xpub(xpub_text):
+        await message.answer(
+            "Некорректный xPub. Отправьте корректный xPub (начинается обычно с 'xpub', 'ypub', 'zpub') или /cancel для отмены."
+        )
+        return
+
     db = message.bot.db
     # Find next available account index for this seller
     buyers = get_buyer_groups_by_seller(db, telegram_id)
@@ -687,15 +711,21 @@ async def process_add_buyer_xpub(message: types.Message, state: FSMContext):
     next_account = 0
     while next_account in used_accounts:
         next_account += 1
-    create_buyer_group(
-        db,
-        seller_id=telegram_id,
-        buyer_id=buyer_id,
-        invoices_group=next_account,
-        xpub=xpub,
-    )
+    try:
+        create_buyer_group(
+            db,
+            seller_id=telegram_id,
+            buyer_id=buyer_id,
+            invoices_group=next_account,
+            xpub=xpub_text,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to create buyer group for user {telegram_id}: {e}")
+        await message.answer("Ошибка при сохранении покупателя. Попробуйте позже или /cancel.")
+        return
+
     logger.info(
-        f"User {telegram_id} added buyer: {buyer_id} | account: {next_account} | xpub: {xpub}"
+        f"User {telegram_id} added buyer: {buyer_id} | account: {next_account} | xpub: {xpub_text}"
     )
     await message.answer(
         f"Покупатель {buyer_id} с аккаунтом {next_account} и xPub добавлен."
@@ -704,32 +734,242 @@ async def process_add_buyer_xpub(message: types.Message, state: FSMContext):
     await state.clear()
 
 
-async def handle_sweep(message: types.Message):
+async def handle_sweep(message: types.Message, state: FSMContext = None):
+    """Initiate sweep process with option for partial invoices.
+    Always resets any previous FSM state to avoid conflicts with other flows (/add_buyer etc)."""
     telegram_id = message.from_user.id
     logger.info(f"User {telegram_id} called /sweep")
-    paid_invoices = [
-        inv
-        for inv in get_invoices_by_seller(db=message.bot.db, seller_id=telegram_id)
-        if inv.status == "paid"
-    ]
-    total = sum(inv.amount for inv in paid_invoices)
-    count = len(paid_invoices)
-    logger.info(f"User {telegram_id} sweep: {count} invoices, total {total} TRX")
-    if not paid_invoices:
-        await message.answer("Нет оплаченных инвойсов для вывода.")
+    db = message.bot.db
+
+    # Clear any previous state to prevent handlers (like add_buyer xpub) from intercepting reply buttons
+    if state is not None:
+        prev = await state.get_state()
+        if prev:
+            logger.debug(f"/sweep clearing previous FSM state {prev} for user {telegram_id}")
+            await state.clear()
+
+    invoices = get_invoices_by_seller(db=db, seller_id=telegram_id)
+
+    # Determine paid/partial based on actual received amounts (transactions),
+    # not only the stored invoice.status. This allows sweeping when funds arrived
+    # but the status hasn't been updated yet (e.g., during activation).
+    paid_invoices: list = []
+    partial_invoices: list = []
+    for inv in invoices:
+        try:
+            txs = get_transactions_by_invoice(db, inv.id)
+            total_received = sum(float(t.amount_received or 0) for t in txs)
+        except Exception:
+            total_received = 0.0
+        try:
+            amount_required = float(getattr(inv, "amount", 0) or 0)
+        except Exception:
+            amount_required = 0.0
+
+        if amount_required > 0 and total_received >= amount_required:
+            paid_invoices.append(inv)
+        elif total_received > 0:
+            partial_invoices.append(inv)
+
+    if not paid_invoices and not partial_invoices:
+        logger.info(f"User {telegram_id} sweep: no paid or partial invoices (by tx analysis)")
+        await message.answer("Нет оплаченных или частично оплаченных инвойсов для вывода.")
         return
-    await message.answer(
-        f"Будет обработано {count} инвойсов на сумму {total} TRX. Подтвердите выполнение? (да/нет)"
-    )
-    # Здесь можно реализовать FSM для подтверждения
-    # После подтверждения:
+
+    total_paid = 0.0
     for inv in paid_invoices:
-        logger.info(
-            f"User {telegram_id} sweeping invoice {inv.id} address {inv.address}"
+        try:
+            total_paid += float(getattr(inv, "amount", 0) or 0)
+        except Exception:
+            pass
+
+    total_partial_received = 0.0
+    for inv in partial_invoices:
+        try:
+            txs = get_transactions_by_invoice(db, inv.id)
+            total_partial_received += sum(float(t.amount_received or 0) for t in txs)
+        except Exception:
+            pass
+
+    # Helper: fetch technical state for an address (best effort)
+    def _fetch_invoice_tech_state(addr: str) -> dict:
+        try:
+            from src.core.config import config as _cfg
+            import requests
+            from datetime import datetime, timezone
+            base = _cfg.tron.get_tron_client_config().get("full_node")
+            headers = {"Content-Type": "application/json"}
+
+            def _post(path: str, payload: dict):
+                try:
+                    r = requests.post(f"{base}{path}", json=payload, headers=headers, timeout=5)
+                    if r.ok:
+                        return r.json() or {}
+                except Exception:
+                    return {}
+                return {}
+
+            # Account and balance
+            acc = _post("/wallet/getaccount", {"address": addr, "visible": True})
+            activated = bool(acc)
+            balance_sun = int((acc or {}).get("balance", 0) or 0)
+            balance_trx = balance_sun / 1_000_000
+
+            # Resources
+            res = _post("/wallet/getaccountresource", {"address": addr, "visible": True}) or {}
+            try:
+                energy_avail = max(0, int(res.get("EnergyLimit", 0)) - int(res.get("EnergyUsed", 0)))
+            except Exception:
+                energy_avail = 0
+            try:
+                free_bw_avail = max(0, int(res.get("freeNetLimit", 0)) - int(res.get("freeNetUsed", 0)))
+                paid_bw_avail = max(0, int(res.get("NetLimit", 0)) - int(res.get("NetUsed", 0)))
+                bw_avail = free_bw_avail + paid_bw_avail
+            except Exception:
+                free_bw_avail = 0
+                paid_bw_avail = 0
+                bw_avail = 0
+
+            # Delegation reclaim ETA (nearest expiry among incoming delegations)
+            eta_str = "—"
+            try:
+                dr = _post("/wallet/getdelegatedresourcev2", {"toAddress": addr, "visible": True}) or {}
+                items = dr.get("delegatedResource", []) or dr.get("delegated_resource", [])
+                soonest = None
+                now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+                for it in items or []:
+                    # look for expire_time in ms
+                    exp = it.get("expire_time") or it.get("expireTime")
+                    if isinstance(exp, (int, float)) and exp > now_ms:
+                        if soonest is None or exp < soonest:
+                            soonest = exp
+                if soonest:
+                    delta_s = max(0, int((soonest - now_ms) / 1000))
+                    days = delta_s // 86400
+                    hours = (delta_s % 86400) // 3600
+                    mins = (delta_s % 3600) // 60
+                    if days > 0:
+                        eta_str = f"{days}д {hours}ч"
+                    elif hours > 0:
+                        eta_str = f"{hours}ч {mins}м"
+                    else:
+                        eta_str = f"{mins}м"
+            except Exception:
+                eta_str = "—"
+
+            return {
+                "activated": activated,
+                "trx": balance_trx,
+                "energy": energy_avail,
+                "bw": bw_avail,
+                "bw_free": free_bw_avail,
+                "bw_paid": paid_bw_avail,
+                "delegation_eta": eta_str,
+            }
+        except Exception:
+            return {"activated": False, "trx": 0.0, "energy": 0, "bw": 0, "bw_free": 0, "bw_paid": 0, "delegation_eta": "—"}
+
+    keyboard_rows = []
+    if paid_invoices:
+        keyboard_rows.append([types.KeyboardButton(text="Снять только оплаченные")])
+    if paid_invoices or partial_invoices:
+        keyboard_rows.append([types.KeyboardButton(text="Снять включая частичные")])
+    keyboard_rows.append([types.KeyboardButton(text="Отмена")])
+    kb = types.ReplyKeyboardMarkup(keyboard=keyboard_rows, resize_keyboard=True)
+
+    text_lines = ["Запуск процедуры вывода:"]
+    if paid_invoices:
+        text_lines.append(f"• Полностью оплачено: {len(paid_invoices)} шт. на сумму {total_paid:.2f} USDT")
+    if partial_invoices:
+        text_lines.append(
+            f"• Частично оплачено: {len(partial_invoices)} шт., получено суммарно {total_partial_received:.2f} USDT"
         )
-        prepare_for_sweep(inv.address)
-        update_invoice(db=message.bot.db, invoice_id=inv.id, status="swept")
-    await message.answer("Все оплаченные инвойсы обработаны и выведены.")
+        text_lines.append(
+            "Вы можете вывести средства с адресов частичных инвойсов (будут помечены как 'swept') или подождать полного платежа."
+        )
+
+    # Append technical state for involved invoices
+    try:
+        text_lines.append("\nТехническое состояние адресов:")
+        for inv in paid_invoices + partial_invoices:
+            addr = getattr(inv, "address", "") or ""
+            state_info = _fetch_invoice_tech_state(addr)
+            short_addr = (addr[:8] + "..." + addr[-6:]) if addr and len(addr) > 16 else addr
+            act = "да" if state_info.get("activated") else "нет"
+            trx = state_info.get("trx", 0.0)
+            en = state_info.get("energy", 0)
+            bw_free = state_info.get("bw_free", 0)
+            bw_paid = state_info.get("bw_paid", 0)
+            eta = state_info.get("delegation_eta", "—")
+            text_lines.append(
+                f"• #{inv.id} {short_addr}: активирован: {act}, TRX: {trx:.3f}, Energy: {en}, BW: free {bw_free} / paid {bw_paid}, возврат делегации через: {eta}"
+            )
+    except Exception:
+        # Non-fatal; skip details if node not reachable
+        pass
+
+    text_lines.append("Выберите действие:")
+
+    await message.answer("\n".join(text_lines), reply_markup=kb)
+    if state is not None:
+        await state.set_state(SweepFSM.choose_mode)
+        await state.update_data(paid_ids=[inv.id for inv in paid_invoices], partial_ids=[inv.id for inv in partial_invoices])
+
+
+async def process_sweep_mode_choice(message: types.Message, state: FSMContext):
+    telegram_id = message.from_user.id
+    choice = message.text.strip()
+    db = message.bot.db
+    data = await state.get_data()
+    paid_ids = data.get("paid_ids", [])
+    partial_ids = data.get("partial_ids", [])
+
+    if choice.lower().startswith("отмена"):
+        from aiogram.types import ReplyKeyboardRemove
+        await message.answer("Операция отменена.", reply_markup=ReplyKeyboardRemove())
+        await show_main_menu(message, state)
+        await state.clear()
+        return
+
+    if choice not in {"Снять только оплаченные", "Снять включая частичные"}:
+        await message.answer("Пожалуйста, выберите вариант из клавиатуры.")
+        return
+
+    sweep_partial = choice == "Снять включая частичные"
+
+    to_sweep_ids = paid_ids + (partial_ids if sweep_partial else [])
+    if not to_sweep_ids:
+        from aiogram.types import ReplyKeyboardRemove
+        await message.answer("Нет выбранных инвойсов для вывода.", reply_markup=ReplyKeyboardRemove())
+        await state.clear()
+        return
+
+    success_count = 0
+    failed_ids = []
+    for inv in get_invoices_by_seller(db, telegram_id):
+        if inv.id in to_sweep_ids:
+            try:
+                ok = prepare_for_sweep(inv.address)
+                if ok:
+                    update_invoice(db=db, invoice_id=inv.id, status="swept")
+                    success_count += 1
+                else:
+                    failed_ids.append(inv.id)
+                    logger.warning(f"Sweep preparation returned False for invoice {inv.id} (address {inv.address})")
+            except Exception as e:
+                failed_ids.append(inv.id)
+                logger.warning(f"Sweep failed for invoice {inv.id}: {e}")
+
+    from aiogram.types import ReplyKeyboardRemove
+    details = ""
+    if failed_ids:
+        details = f"\nНе удалось подготовить: {len(failed_ids)} (ID: {', '.join(map(str, failed_ids[:10]))}{'...' if len(failed_ids)>10 else ''})"
+    await message.answer(
+        f"Готово. Успешно подготовлено {success_count} инвойсов. Частично оплаченные были {'включены' if sweep_partial else 'пропущены'}.{details}",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await show_main_menu(message, state)
+    await state.clear()
 
 
 async def process_register_xpub(message: types.Message, state: FSMContext):
@@ -942,6 +1182,14 @@ def register_help_handler(dp, seller_handlers):
     dp.message.register(seller_handlers.handle_help, commands=["help"])
 
 
+# Register sweep FSM handler
+
+def register_sweep_handlers(dp, seller_handlers):
+    dp.message.register(
+        seller_handlers.process_sweep_mode_choice, seller_handlers.SweepFSM.choose_mode
+    )
+
+
 # Gas Station and Keeper Bot handlers
 async def handle_gasstation(message: types.Message):
     """Handle gas station status and management"""
@@ -1129,12 +1377,12 @@ async def handle_keeper_logs(message: types.Message):
             # Clean up the log line for display
             clean_log = log.strip()
             if len(clean_log) > 100:
-                clean_log = clean_log[:97] + "..."
-            response += f"`{clean_log}`\n"
+                clean_log = clean_log[:97] + "...";
+            response += f"`{clean_log}`\n";
 
-        response += f"\n📊 **Total entries:** {len(keeper_logs)}"
+        response += f"\n📊 **Total entries:** {len(keeper_logs)}";
 
-        await message.answer(response, parse_mode="Markdown")
+        await message.answer(response, parse_mode="Markdown");
 
     except Exception as e:
         logger.error(f"Error reading keeper logs: {e}")

@@ -3,6 +3,7 @@
 import os
 from dotenv import load_dotenv
 import logging
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -58,15 +59,42 @@ class TronConfig:
         
         # Resource delegation settings (network-specific)
         if self.network == "testnet":
-            # Lower amounts for testnet
+            # Testnet defaults tuned to reach TRC20 transfer energy in a few steps
             self.auto_activation_amount = float(os.getenv("AUTO_ACTIVATION_TRX_AMOUNT", "1.0"))
-            self.energy_delegation_amount = float(os.getenv("ENERGY_DELEGATION_TRX_AMOUNT", "1.0"))
-            self.bandwidth_delegation_amount = float(os.getenv("BANDWIDTH_DELEGATION_TRX_AMOUNT", "0.5"))
-        else:
-            # Production amounts for mainnet
-            self.auto_activation_amount = float(os.getenv("AUTO_ACTIVATION_TRX_AMOUNT", "1.5"))
-            self.energy_delegation_amount = float(os.getenv("ENERGY_DELEGATION_TRX_AMOUNT", "2.0"))
+            # Bump energy delegation step for faster convergence
+            self.energy_delegation_amount = float(os.getenv("ENERGY_DELEGATION_TRX_AMOUNT", "20.0"))
             self.bandwidth_delegation_amount = float(os.getenv("BANDWIDTH_DELEGATION_TRX_AMOUNT", "1.0"))
+        else:
+            # Mainnet defaults (conservative but sufficient)
+            self.auto_activation_amount = float(os.getenv("AUTO_ACTIVATION_TRX_AMOUNT", "1.5"))
+            # Bump energy delegation step for faster convergence
+            self.energy_delegation_amount = float(os.getenv("ENERGY_DELEGATION_TRX_AMOUNT", "20.0"))
+            self.bandwidth_delegation_amount = float(os.getenv("BANDWIDTH_DELEGATION_TRX_AMOUNT", "2.0"))
+        
+        # Target resource thresholds to enable USDT transfer reliably
+        # Energy target bumped to cover up to ~4 TRC20 transfers per address with headroom
+        self.target_energy_units = int(os.getenv("TARGET_ENERGY_UNITS", "90000"))
+        # Bandwidth target; fresh activation grants ~600 free bandwidth, add headroom
+        self.target_bandwidth_units = int(os.getenv("TARGET_BANDWIDTH_UNITS", "1000"))
+        
+        # Heuristic conversion estimates (units per 1 TRX staked); tune per network
+        self.energy_units_per_trx_estimate = int(os.getenv("ENERGY_UNITS_PER_TRX_ESTIMATE", "300"))
+        self.bandwidth_units_per_trx_estimate = int(os.getenv("BANDWIDTH_UNITS_PER_TRX_ESTIMATE", "1500"))
+        
+        # Per-transfer resource estimates for TRC20 USDT transfer (used to top-up only as needed)
+        # Tune via env if your network requires different amounts
+        self.usdt_energy_per_transfer_estimate = int(os.getenv("USDT_ENERGY_PER_TRANSFER_ESTIMATE", "25000"))
+        self.usdt_bandwidth_per_transfer_estimate = int(os.getenv("USDT_BANDWIDTH_PER_TRANSFER_ESTIMATE", "400"))
+        
+        # Safety caps per invoice so we don't drain gas wallet on a single address (bumped for higher targets)
+        self.max_energy_delegation_trx_per_invoice = float(os.getenv("MAX_ENERGY_DELEGATION_TRX_PER_INVOICE", "300.0"))
+        self.max_bandwidth_delegation_trx_per_invoice = float(os.getenv("MAX_BANDWIDTH_DELEGATION_TRX_PER_INVOICE", "5.0"))
+        
+        # Account activation mode: 'transfer' (send TRX) or 'create_account' (no TRX transfer)
+        self.account_activation_mode = os.getenv("GAS_ACCOUNT_ACTIVATION_MODE", "transfer").lower()
+        if self.account_activation_mode not in {"transfer", "create_account"}:
+            logger.warning("Invalid GAS_ACCOUNT_ACTIVATION_MODE=%s, falling back to 'transfer'", self.account_activation_mode)
+            self.account_activation_mode = "transfer"
         
         # Validation
         self._validate_config()
@@ -123,10 +151,9 @@ class TronConfig:
             return False
             
         try:
-            import requests
             response = requests.get(f"{self.local_full_node}/wallet/getnowblock", timeout=5)
             return response.status_code == 200
-        except Exception:
+        except requests.RequestException:
             return False
     
     def get_fallback_client_config(self) -> dict:

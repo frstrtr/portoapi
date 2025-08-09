@@ -253,7 +253,12 @@ async def main():
     )
     dp.message.register(
         log_and_handle(seller_handlers.process_add_buyer_xpub, "add_buyer_xpub"),
-        seller_handlers.process_add_buyer_xpub,
+        seller_handlers.AddBuyerFSM.xpub,
+    )
+    # Register sweep mode choice FSM handler
+    dp.message.register(
+        log_and_handle(seller_handlers.process_sweep_mode_choice, "sweep_mode_choice"),
+        seller_handlers.SweepFSM.choose_mode,
     )
 
     max_retries = 10

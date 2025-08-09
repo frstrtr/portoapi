@@ -235,10 +235,33 @@ class KeeperBot:
             account_info = self.client.get_account(address)
             not_activated = account_info is None
         except Exception as e:
-            logger.error("Error checking TRX account for %s: %s", address, e)
+            # Downgrade specific 'account not found' noise and treat as not activated
+            msg = str(e).lower()
+            if 'account not found' in msg or 'does not exist' in msg:
+                logger.info("Account not yet activated on-chain for %s (invoice %s)", address, invoice.id)
+            else:
+                logger.error("Error checking TRX account for %s: %s", address, e)
             # Try to reconnect on account check failure
             self._reconnect_if_needed()
             not_activated = True
+
+        # Proactive activation & resource delegation BEFORE any USDT arrives
+        # so incoming TRC20 transfer will succeed without sender providing TRX.
+        if not_activated and balance == 0 and invoice.status not in ('activating', 'paid', 'swept'):
+            try:
+                logger.info("Proactive activation attempt for address %s (invoice %s)", address, invoice.id)
+                update_invoice(db, invoice.id, status='activating')
+                ok = auto_activate_on_usdt_receive(address)
+                if ok:
+                    logger.info("Proactive activation successful for %s (invoice %s)", address, invoice.id)
+                    # Return to pending until payment detected; keep 'partial' if it was partial
+                    refreshed = get_invoice(db, invoice.id)
+                    if refreshed.status == 'activating':
+                        update_invoice(db, invoice.id, status='pending')
+                else:
+                    logger.warning("Proactive activation failed for %s (invoice %s)", address, invoice.id)
+            except Exception as e:
+                logger.error("Error during proactive activation for %s (invoice %s): %s", address, invoice.id, e)
 
         if balance > 0:
             logger.info("Invoice %s has received %s USDT at address %s", 

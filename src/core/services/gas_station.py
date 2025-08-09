@@ -8,6 +8,9 @@ import logging
 from src.core.database.db_service import get_seller_wallet, create_seller_wallet
 from src.core.config import config
 from bip_utils import Bip44, Bip44Coins, Bip44Changes, Bip39SeedGenerator
+import requests  # added for direct RPC fallback
+from types import SimpleNamespace
+from sqlalchemy.exc import SQLAlchemyError
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +20,8 @@ class GasStationManager:
     def __init__(self):
         self.tron_config = config.tron
         self.client = self._get_tron_client()
-        
+        self._gas_wallet_address = None  # cache
+    
     def _get_tron_client(self) -> Tron:
         """Create and configure TRON client with local node preference"""
         client = self._try_create_local_client()
@@ -42,7 +46,7 @@ class GasStationManager:
             client_config = self.tron_config.get_tron_client_config()
             
             if client_config["node_type"] == "local":
-                # Create provider for local node
+                # Create provider for local node (full node)
                 provider = HTTPProvider(endpoint_uri=client_config["full_node"])
                 client = Tron(provider=provider)
                 
@@ -52,7 +56,7 @@ class GasStationManager:
                 logger.info("Connected to local TRON node at %s", client_config["full_node"])
                 return client
                 
-        except Exception as e:
+        except (requests.RequestException, ValueError, RuntimeError) as e:
             logger.warning("Failed to connect to local TRON node: %s", e)
             
         return None
@@ -106,7 +110,7 @@ class GasStationManager:
                 "latest_block": latest_block.get("blockID", "")[:16] if latest_block else None
             })
             
-        except Exception as e:
+        except (requests.RequestException, ValueError, KeyError, RuntimeError) as e:
             health_info["error"] = str(e)
             logger.warning("TRON connection health check failed: %s", e)
         
@@ -137,34 +141,64 @@ class GasStationManager:
                     logger.error("Failed to reconnect to TRON network")
                     return False
                     
-            except Exception as e:
+            except (requests.RequestException, RuntimeError) as e:
                 logger.error("Error during TRON reconnection: %s", e)
                 return False
         
         return True
     
     def _get_gas_wallet_account(self):
-        """Get gas wallet account for single wallet mode"""
+        """Get gas wallet account object with .address (supports pk or mnemonic)"""
+        if self._gas_wallet_address:
+            return SimpleNamespace(address=self._gas_wallet_address)
+
         if self.tron_config.gas_station_type != "single":
             raise ValueError("Gas wallet account only available in single wallet mode")
-        
+
+        # Private key path
         if self.tron_config.gas_wallet_private_key:
-            return self.client.generate_address(self.tron_config.gas_wallet_private_key)
+            try:
+                pk = PrivateKey(bytes.fromhex(self.tron_config.gas_wallet_private_key))
+                self._gas_wallet_address = pk.public_key.to_base58check_address()
+            except ValueError as e:
+                logger.error("Invalid GAS_WALLET_PRIVATE_KEY: %s", e)
+                raise
         elif self.tron_config.gas_wallet_mnemonic:
-            # Generate address from mnemonic
             seed_bytes = Bip39SeedGenerator(self.tron_config.gas_wallet_mnemonic).Generate()
             bip44_ctx = Bip44.FromSeed(seed_bytes, Bip44Coins.TRON)
             account_ctx = bip44_ctx.Purpose().Coin().Account(0)
-            address = account_ctx.Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
-            
-            # Create a simple address object
-            class AddressInfo:
-                def __init__(self, address):
-                    self.address = address
-            
-            return AddressInfo(address)
+            self._gas_wallet_address = account_ctx.Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
         else:
             raise ValueError("No gas wallet credentials configured")
+
+        return SimpleNamespace(address=self._gas_wallet_address)
+
+    def get_gas_wallet_address(self) -> str:
+        """Public accessor for gas wallet address (ensures cached)."""
+        if not self._gas_wallet_address:
+            _ = self._get_gas_wallet_account()
+        return self._gas_wallet_address
+
+    def _get_gas_wallet_private_key(self) -> PrivateKey:
+        """Return tronpy PrivateKey for gas wallet (supports mnemonic fallback)."""
+        if self.tron_config.gas_wallet_private_key:
+            try:
+                return PrivateKey(bytes.fromhex(self.tron_config.gas_wallet_private_key))
+            except ValueError as e:
+                logger.error("Invalid GAS_WALLET_PRIVATE_KEY: %s", e)
+                raise
+        if self.tron_config.gas_wallet_mnemonic:
+            try:
+                seed_bytes = Bip39SeedGenerator(self.tron_config.gas_wallet_mnemonic).Generate()
+                bip44_ctx = Bip44.FromSeed(seed_bytes, Bip44Coins.TRON)
+                account_ctx = bip44_ctx.Purpose().Coin().Account(0)
+                addr_ctx = account_ctx.Change(Bip44Changes.CHAIN_EXT).AddressIndex(0)
+                raw_hex = addr_ctx.PrivateKey().Raw().ToHex()
+                return PrivateKey(bytes.fromhex(raw_hex))
+            except (ValueError, RuntimeError) as e:
+                logger.error("Failed to derive gas wallet private key from mnemonic: %s", e)
+                raise
+        raise ValueError("Gas wallet credentials not configured (private key or mnemonic required)")
     
     def prepare_for_sweep(self, invoice_address: str) -> bool:
         """
@@ -188,75 +222,78 @@ class GasStationManager:
         except ValueError as e:
             logger.error("Value error in prepare_for_sweep: %s", e)
             return False
-        except Exception as e:
+        except (requests.RequestException, RuntimeError) as e:
             logger.error("Error in prepare_for_sweep: %s", e)
             return False
     
     def _prepare_for_sweep_single(self, invoice_address: str) -> bool:
-        """Handle sweep preparation for single wallet mode"""
-        if not self.tron_config.gas_wallet_private_key:
-            logger.error("Gas wallet private key not configured for single wallet mode")
+        """Prepare target address for sweeping in single wallet mode.
+        Rules:
+        - If target account doesn't exist, send TRX activation transfer first.
+        - After activation, delegate ENERGY and BANDWIDTH according to need for 1 USDT transfer.
+        - If account already exists, skip activation and delegate only when needed.
+        """
+        if not (self.tron_config.gas_wallet_private_key or self.tron_config.gas_wallet_mnemonic):
+            logger.error("Gas wallet credentials not configured for single wallet mode (need GAS_WALLET_PRIVATE_KEY or GAS_WALLET_MNEMONIC)")
             return False
-        
         try:
-            # 1. Send TRX for activation
-            activation_amount = int(self.tron_config.auto_activation_amount * 1_000_000)
-            txn = (
-                self.client.trx.transfer(
-                    self._get_gas_wallet_account().address,
-                    invoice_address,
-                    activation_amount
+            signing_pk = self._get_gas_wallet_private_key()
+            owner_addr = signing_pk.public_key.to_base58check_address()
+
+            # Check if target account exists
+            need_activation = True
+            try:
+                acc = self.client.get_account(invoice_address)
+                if acc:
+                    need_activation = False
+                    logger.info("[gas_station] Account %s already exists; activation transfer not required", invoice_address)
+            except (requests.RequestException, ValueError, RuntimeError) as e:
+                logger.info("[gas_station] Account %s not found on-chain: %s (will activate)", invoice_address, e)
+
+            # Compute required TRX in gas wallet: delegation + optional activation + fee buffer
+            activation_trx = self.tron_config.auto_activation_amount if need_activation else 0.0
+            needed_trx = activation_trx + self.tron_config.energy_delegation_amount + self.tron_config.bandwidth_delegation_amount + 0.5
+            try:
+                owner_balance_trx = self.client.get_account_balance(owner_addr)
+            except (requests.RequestException, ValueError, RuntimeError) as e:
+                logger.warning("[gas_station] Could not fetch owner balance: %s", e)
+                owner_balance_trx = -1
+            if owner_balance_trx >= 0 and owner_balance_trx < needed_trx:
+                logger.error(
+                    "[gas_station] Insufficient TRX in gas wallet %.3f < needed %.3f (addr=%s)",
+                    owner_balance_trx,
+                    needed_trx,
+                    owner_addr,
                 )
-                .build()
-                .sign(self.tron_config.gas_wallet_private_key)
-            )
-            result = txn.broadcast()
-            txid = result["txid"]
-            
-            # Wait for confirmation
-            if not self._wait_for_transaction(txid, "TRX activation"):
                 return False
-            
-            # 2. Delegate energy
-            energy_amount = int(self.tron_config.energy_delegation_amount * 1_000_000)
-            delegate_energy_txn = (
-                self.client.trx.delegate_resource(
-                    owner=self._get_gas_wallet_account().address,
-                    receiver=invoice_address,
-                    balance=energy_amount,
-                    resource="ENERGY",
-                )
-                .build()
-                .sign(self.tron_config.gas_wallet_private_key)
-            )
-            energy_result = delegate_energy_txn.broadcast()
-            energy_txid = energy_result["txid"]
-            
-            if not self._wait_for_transaction(energy_txid, "ENERGY delegation"):
+
+            # Activation (if needed)
+            if need_activation:
+                activation_amount = int(self.tron_config.auto_activation_amount * 1_000_000)
+                logger.info("[gas_station] Activating %s via TRX transfer %.6f TRX", invoice_address, self.tron_config.auto_activation_amount)
+                try:
+                    txn = (
+                        self.client.trx.transfer(owner_addr, invoice_address, activation_amount)
+                        .build()
+                        .sign(signing_pk)
+                    )
+                    result = txn.broadcast()
+                    txid = result.get("txid")
+                    if not txid or not self._wait_for_transaction(txid, "TRX activation"):
+                        return False
+                except (requests.RequestException, ValueError, RuntimeError) as e:
+                    logger.error("[gas_station] Activation transfer failed for %s: %s", invoice_address, e)
+                    return False
+                # Give the node a moment to reflect free bandwidth from activation
+                time.sleep(2)
+
+            # Delegate resources only if needed to execute a USDT transfer
+            if not self._ensure_minimum_resources_for_usdt(owner_addr, invoice_address, signing_pk):
                 return False
-            
-            # 3. Delegate bandwidth
-            bandwidth_amount = int(self.tron_config.bandwidth_delegation_amount * 1_000_000)
-            delegate_bw_txn = (
-                self.client.trx.delegate_resource(
-                    owner=self._get_gas_wallet_account().address,
-                    receiver=invoice_address,
-                    balance=bandwidth_amount,
-                    resource="BANDWIDTH",
-                )
-                .build()
-                .sign(self.tron_config.gas_wallet_private_key)
-            )
-            bw_result = delegate_bw_txn.broadcast()
-            bw_txid = bw_result["txid"]
-            
-            if self._wait_for_transaction(bw_txid, "BANDWIDTH delegation"):
-                logger.info("Successfully prepared sweep for %s", invoice_address)
-                return True
-            
-            return False
-            
-        except Exception as e:
+
+            logger.info("Successfully prepared (activated if needed + delegated) %s", invoice_address)
+            return True
+        except (requests.RequestException, RuntimeError) as e:
             logger.error("Error in single wallet sweep preparation: %s", e)
             return False
     
@@ -268,135 +305,431 @@ class GasStationManager:
         logger.warning("Multisig sweep preparation not implemented yet for %s", invoice_address)
         return False
     
-    def _wait_for_transaction(self, txid: str, operation: str, max_attempts: int = 30) -> bool:
-        """Wait for transaction confirmation"""
+    def _wait_for_transaction(self, txid: str, operation: str, max_attempts: int = 40) -> bool:
+        """Wait for transaction confirmation with resilient polling and multiple fallbacks.
+        Tries tronpy, local solidity gettransactioninfobyid, local solidity gettransactionbyid,
+        and remote equivalents. Treats contractRet SUCCESS as confirmation too.
+        """
         logger.info("Waiting for %s transaction: %s", operation, txid)
-        
-        for _ in range(max_attempts):
+        for attempt in range(max_attempts):
+            # 1) Try tronpy client (may raise JSON errors on flaky nodes)
             try:
                 receipt = self.client.get_transaction_info(txid)
                 if receipt and receipt.get("receipt", {}).get("result") == "SUCCESS":
                     logger.info("%s successful: %s", operation, txid)
                     return True
-                time.sleep(2)
-            except Exception as e:
-                logger.warning("Error checking transaction %s: %s", txid, e)
-                time.sleep(2)
-        
+            except (requests.RequestException, ValueError, RuntimeError) as e:
+                # Quiet early errors
+                if attempt < 5:
+                    logger.debug("tronpy get_transaction_info error (attempt %d/%d): %s", attempt + 1, max_attempts, e)
+                else:
+                    logger.warning("tronpy get_transaction_info error (attempt %d/%d): %s", attempt + 1, max_attempts, e)
+
+            # 2) Fallbacks: local/remote solidity and fullnode endpoints
+            try:
+                headers = {"Content-Type": "application/json"}
+                # Local endpoints
+                local_conf = self.tron_config.get_tron_client_config()
+                local_sol = local_conf.get("solidity_node")
+                local_full = local_conf.get("full_node")
+
+                # Helper to check responses
+                def _is_success_json(obj: dict) -> bool:
+                    if not obj:
+                        return False
+                    if obj.get("receipt", {}).get("result") == "SUCCESS":
+                        return True
+                    # gettransactionbyid style
+                    ret = obj.get("ret")
+                    if isinstance(ret, list) and ret and isinstance(ret[0], dict):
+                        if ret[0].get("contractRet") == "SUCCESS":
+                            return True
+                    return False
+
+                # Local solidity gettransactioninfobyid
+                if local_sol:
+                    url = f"{local_sol}/walletsolidity/gettransactioninfobyid"
+                    resp = requests.post(url, json={"value": txid}, headers=headers, timeout=5)
+                    if resp.ok:
+                        data = resp.json() or {}
+                        if _is_success_json(data):
+                            logger.info("%s successful via local walletsolidity/gettransactioninfobyid", operation)
+                            return True
+                # Local solidity gettransactionbyid (checks contractRet)
+                if local_sol:
+                    url = f"{local_sol}/walletsolidity/gettransactionbyid"
+                    resp = requests.post(url, json={"value": txid}, headers=headers, timeout=5)
+                    if resp.ok:
+                        data = resp.json() or {}
+                        if _is_success_json(data):
+                            logger.info("%s successful via local walletsolidity/gettransactionbyid", operation)
+                            return True
+                # Remote solidity
+                remote_sol = self.tron_config.remote_solidity_node
+                if remote_sol:
+                    rh = dict(headers)
+                    if self.tron_config.api_key:
+                        rh["TRON-PRO-API-KEY"] = self.tron_config.api_key
+                    url = f"{remote_sol}/walletsolidity/gettransactioninfobyid"
+                    resp = requests.post(url, json={"value": txid}, headers=rh, timeout=8)
+                    if resp.ok:
+                        data = resp.json() or {}
+                        if _is_success_json(data):
+                            logger.info("%s successful via remote walletsolidity/gettransactioninfobyid", operation)
+                            return True
+                    url = f"{remote_sol}/walletsolidity/gettransactionbyid"
+                    resp = requests.post(url, json={"value": txid}, headers=rh, timeout=8)
+                    if resp.ok:
+                        data = resp.json() or {}
+                        if _is_success_json(data):
+                            logger.info("%s successful via remote walletsolidity/gettransactionbyid", operation)
+                            return True
+                # As last resort, try fullnode gettransactionbyid (may not be confirmed yet)
+                if local_full:
+                    url = f"{local_full}/wallet/gettransactionbyid"
+                    resp = requests.post(url, json={"value": txid}, headers=headers, timeout=5)
+                    if resp.ok:
+                        data = resp.json() or {}
+                        if _is_success_json(data):
+                            logger.info("%s successful via local wallet/gettransactionbyid", operation)
+                            return True
+            except (requests.RequestException, ValueError) as fe:
+                if attempt < 5:
+                    logger.debug("Fallback tx lookup error (attempt %d/%d): %s", attempt + 1, max_attempts, fe)
+                else:
+                    logger.warning("Fallback tx lookup error (attempt %d/%d): %s", attempt + 1, max_attempts, fe)
+
+            time.sleep(2)
+
         logger.error("%s failed or timed out: %s", operation, txid)
         return False
-    
-    def auto_activate_on_usdt_receive(self, invoice_address: str) -> bool:
+
+    def _get_account_resources(self, address: str) -> dict:
+        """Return current account resources: energy/bandwidth available.
+        Bandwidth combines free and paid (delegated) bandwidth.
         """
-        Проверяет, активирован ли адрес, и если нет — вызывает prepare_for_sweep.
-        """
-        logger.info("Checking activation status for address: %s", invoice_address)
-        
         try:
-            acc_info = self.client.get_account(invoice_address)
-            # Tron semantics: account is not activated ONLY if get_account returns None
-            if acc_info is None:
-                logger.info("Address %s not activated, activating...", invoice_address)
-                return self.prepare_for_sweep(invoice_address)
-            
-            logger.info("Address %s already activated", invoice_address)
-            return True
-            
-        except Exception as e:
-            logger.error("Error in auto_activate_on_usdt_receive: %s", e)
-            return False
-    
-    def get_or_create_tron_deposit_address(
-        self, db, seller_id: int, deposit_type: str = "TRX", xpub: str = None, account: int = None
-    ) -> str:
-        """Generate or retrieve TRON deposit address"""
-        # 1. Check if address already exists for this seller and deposit_type
-        wallet = get_seller_wallet(db, seller_id, deposit_type)
-        if wallet:
-            return wallet.address
+            acc = self.client.get_account_resource(address)
+        except (requests.RequestException):
+            acc = {}
+        try:
+            energy_limit = int(acc.get("EnergyLimit", 0))
+            energy_used = int(acc.get("EnergyUsed", 0))
+        except (TypeError, ValueError):
+            energy_limit = 0
+            energy_used = 0
+        try:
+            free_limit = int(acc.get("freeNetLimit", 0))
+            free_used = int(acc.get("freeNetUsed", 0))
+            paid_limit = int(acc.get("NetLimit", 0))
+            paid_used = int(acc.get("NetUsed", 0))
+        except (TypeError, ValueError):
+            free_limit = free_used = paid_limit = paid_used = 0
+        energy_avail = max(0, energy_limit - energy_used)
+        bandwidth_avail = max(0, (free_limit - free_used) + (paid_limit - paid_used))
+        return {"energy_available": energy_avail, "bandwidth_available": bandwidth_avail}
 
-        # 2. Derive new address (account = seller_id or custom)
-        if account is None:
-            account = seller_id
-
-        # Use xpub if provided, else derive from gas station mnemonic/seed or private key
-        if xpub:
-            # Derive address from xpub using bip_utils
-            pub_ctx = Bip44.FromExtendedKey(xpub, Bip44Coins.TRON)
-            # Always use external chain (0), address index 0 for deposit
-            address = pub_ctx.Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
-            path = f"m/44'/195'/{account}'/0/0"
-        else:
-            # Prefer mnemonic if available, otherwise fallback to private key
-            if self.tron_config.gas_wallet_mnemonic:
-                seed_bytes = Bip39SeedGenerator(self.tron_config.gas_wallet_mnemonic).Generate()
-                bip44_ctx = Bip44.FromSeed(seed_bytes, Bip44Coins.TRON)
-                account_ctx = bip44_ctx.Purpose().Coin().Account(account)
-                # Get xpub for storage if needed
-                xpub = account_ctx.PublicKey().ToExtended()
-                # Derive address for deposit
-                address = account_ctx.Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
-                path = f"m/44'/195'/{account}'/0/0"
-            elif self.tron_config.gas_wallet_private_key:
-                # Derive a deposit address directly from the configured private key
+    def _get_incoming_delegation_summary(self, to_address: str, from_address: str) -> dict:
+        """Return summary of incoming delegations to 'to_address' from 'from_address'.
+        Uses /wallet/getdelegatedresourcev2. Sums energy/bandwidth balances when possible.
+        """
+        base = self.tron_config.get_tron_client_config().get("full_node")
+        headers = {"Content-Type": "application/json"}
+        energy_sum = 0
+        bw_sum = 0
+        count_from_owner = 0
+        try:
+            resp = requests.post(
+                f"{base}/wallet/getdelegatedresourcev2",
+                json={"toAddress": to_address, "visible": True},
+                headers=headers,
+                timeout=5,
+            )
+            if not resp.ok:
+                return {"energy": 0, "bandwidth": 0, "count": 0}
+            try:
+                data = resp.json() or {}
+            except ValueError:
+                return {"energy": 0, "bandwidth": 0, "count": 0}
+            items = data.get("delegatedResource") or data.get("delegated_resource") or []
+            for it in items:
+                src = it.get("fromAddress") or it.get("from_address") or it.get("from")
+                if src != from_address:
+                    continue
+                count_from_owner += 1
+                # Model A: resource+balance
+                resource = it.get("resource")
+                if resource in ("ENERGY", "BANDWIDTH"):
+                    try:
+                        bal = int(it.get("balance", 0) or 0)
+                    except (TypeError, ValueError):
+                        bal = 0
+                    if resource == "ENERGY":
+                        energy_sum += bal
+                    else:
+                        bw_sum += bal
+                # Model B: frozen_balance_for_energy/bandwidth
                 try:
-                    pk = PrivateKey(bytes.fromhex(self.tron_config.gas_wallet_private_key))
-                    address = pk.public_key.to_base58check_address()
-                    path = "m/privkey"
-                    xpub = None
-                except Exception as e:
-                    raise ValueError("Invalid GAS_WALLET_PRIVATE_KEY") from e
-            else:
-                raise ValueError("GAS wallet credentials not configured (mnemonic or private key).")
+                    fe = int(it.get("frozen_balance_for_energy", 0) or 0)
+                    fb = int(it.get("frozen_balance_for_bandwidth", 0) or 0)
+                    energy_sum += fe
+                    bw_sum += fb
+                except (TypeError, ValueError):
+                    pass
+        except requests.RequestException:
+            return {"energy": 0, "bandwidth": 0, "count": 0}
+        return {"energy": energy_sum, "bandwidth": bw_sum, "count": count_from_owner}
 
-        # 3. Save to DB
-        create_seller_wallet(
-            db=db,
-            seller_id=seller_id,
-            address=address,
-            derivation_path=path,
-            deposit_type=deposit_type,
-            xpub=xpub,
-            account=account,
-        )
-        return address
-    
-    def calculate_trx_needed(self, seller) -> float:
-        """Calculate TRX needed for operations based on seller configuration"""
-        # Base amount for activation
-        base_amount = self.tron_config.auto_activation_amount
-        
-        # Additional amounts for delegation
-        energy_amount = self.tron_config.energy_delegation_amount
-        bandwidth_amount = self.tron_config.bandwidth_delegation_amount
-        
-        total = base_amount + energy_amount + bandwidth_amount
-        
-        # You can expand this logic based on seller subscription/tariff
-        if hasattr(seller, 'tariff_plan'):
-            if seller.tariff_plan == 'premium':
-                return total * 2
-            elif seller.tariff_plan == 'standard':
-                return total * 1.5
-                
-        return total
+    def _ensure_minimum_resources_for_usdt(self, owner_addr: str, invoice_address: str, signing_pk: PrivateKey) -> bool:
+        """Ensure invoice address has enough ENERGY and BANDWIDTH to send 1 USDT transfer.
+        Top up only if current available resources are below per-transfer estimates.
+        """
+        try:
+            res = self._get_account_resources(invoice_address)
+            cur_energy = int(res.get("energy_available", 0))
+            cur_bw = int(res.get("bandwidth_available", 0))
+            need_energy = max(0, int(self.tron_config.usdt_energy_per_transfer_estimate))
+            need_bw = max(0, int(self.tron_config.usdt_bandwidth_per_transfer_estimate))
+
+            # If already sufficient, nothing to do
+            if cur_energy >= need_energy and cur_bw >= need_bw:
+                logger.info("[gas_station] Resources already sufficient for USDT transfer at %s (E=%d, BW=%d)", invoice_address, cur_energy, cur_bw)
+                return True
+
+            # Build dynamic targets equal to max(current, required)
+            target_energy = max(cur_energy, need_energy)
+            target_bw = max(cur_bw, need_bw)
+
+            return self._delegate_resources(
+                owner_addr,
+                invoice_address,
+                signing_pk,
+                target_energy_units=target_energy,
+                target_bandwidth_units=target_bw,
+            )
+        except (requests.RequestException, ValueError, RuntimeError) as e:
+            logger.error("[gas_station] Failed ensuring minimum resources for USDT at %s: %s", invoice_address, e)
+            return False
+
+    def _delegate_resources(self, owner_addr: str, invoice_address: str, signing_pk: PrivateKey,
+                            target_energy_units: int | None = None,
+                            target_bandwidth_units: int | None = None) -> bool:
+        """Delegate ENERGY and BANDWIDTH up to configured or provided targets in as few txs as possible.
+        Compute required TRX for the missing units using heuristic unit-per-TRX estimates
+        and send a single delegation per resource, bounded by caps. Fallback to two-step
+        if residue remains due to estimate error.
+        """
+        try:
+            cfg = self.tron_config
+            cap_energy_trx = max(0.0, cfg.max_energy_delegation_trx_per_invoice)
+            cap_bw_trx = max(0.0, cfg.max_bandwidth_delegation_trx_per_invoice)
+
+            # Resolve dynamic targets
+            tgt_energy = int(target_energy_units) if target_energy_units is not None else int(cfg.target_energy_units)
+            tgt_bw = int(target_bandwidth_units) if target_bandwidth_units is not None else int(cfg.target_bandwidth_units)
+
+            # Helper to perform a single delegation tx for a given resource
+            def delegate_once(resource: str, target_units: int, cap_trx: float, units_per_trx: int) -> bool:
+                res_key = "energy_available" if resource == "ENERGY" else "bandwidth_available"
+                before = self._get_account_resources(invoice_address)
+                current = int(before.get(res_key, 0))
+                # Also capture incoming delegation summary from owner
+                prev_summary = self._get_incoming_delegation_summary(invoice_address, owner_addr)
+                prev_e = prev_summary.get("energy", 0)
+                prev_b = prev_summary.get("bandwidth", 0)
+                prev_c = prev_summary.get("count", 0)
+
+                missing = max(0, target_units - current)
+                if missing <= 0:
+                    logger.info("[gas_station] %s target met for %s (current=%d >= target=%d)", resource, invoice_address, current, target_units)
+                    return True
+
+                # Compute needed TRX using estimate and clamp to caps and min constraints
+                if units_per_trx <= 0:
+                    needed_trx = 1.0
+                else:
+                    needed_trx = missing / float(units_per_trx)
+                needed_trx *= 1.05  # headroom
+                if resource == "BANDWIDTH" and needed_trx < 1.0:
+                    needed_trx = 1.0
+                needed_trx = min(needed_trx, cap_trx)
+                amount_sun = int(max(1_000_000, round(needed_trx, 6) * 1_000_000))
+
+                logger.info(
+                    "[gas_station] Single-shot delegating %s %.6f TRX (raw %d) to %s (missing %d units, est %d/unit)",
+                    resource, amount_sun / 1_000_000, amount_sun, invoice_address, missing, units_per_trx,
+                )
+                tx = (
+                    self.client.trx.delegate_resource(
+                        owner=owner_addr,
+                        receiver=invoice_address,
+                        balance=amount_sun,
+                        resource=resource,
+                    )
+                    .build()
+                    .sign(signing_pk)
+                )
+                result = tx.broadcast()
+                txid = result.get("txid")
+
+                # Prefer observing effect: resources or incoming delegation entries from owner
+                for _ in range(12):  # up to ~24s
+                    time.sleep(2)
+                    after = self._get_account_resources(invoice_address)
+                    new = int(after.get(res_key, 0))
+                    if new > current:
+                        logger.info("[gas_station] %s delegation observed on-chain: %d -> %d units", resource, current, new)
+                        break
+                    # Check incoming delegation registry change
+                    cur_summary = self._get_incoming_delegation_summary(invoice_address, owner_addr)
+                    cur_e = cur_summary.get("energy", 0)
+                    cur_b = cur_summary.get("bandwidth", 0)
+                    cur_c = cur_summary.get("count", 0)
+                    if (cur_c > prev_c) or (cur_e > prev_e) or (cur_b > prev_b):
+                        logger.info("[gas_station] %s delegation detected via delegatedresourcev2 (owner->invoice)", resource)
+                        break
+                else:
+                    if not txid or not self._wait_for_transaction(txid, f"{resource} delegation"):
+                        return False
+
+                # If still below target due to conservative estimate, do one small top-up within cap
+                after = self._get_account_resources(invoice_address)
+                new = int(after.get(res_key, 0))
+                remaining = max(0, target_units - new)
+                if remaining > 0 and cap_trx > 0:
+                    if units_per_trx <= 0:
+                        extra_trx = 1.0
+                    else:
+                        extra_trx = max(1.0 if resource == "BANDWIDTH" else 0.5, remaining / float(units_per_trx))
+                    extra_trx *= 1.05
+                    total_trx_used = amount_sun / 1_000_000
+                    extra_trx = min(extra_trx, max(0.0, cap_trx - total_trx_used))
+                    if extra_trx > 0.0:
+                        extra_sun = int(round(extra_trx, 6) * 1_000_000)
+                        logger.info(
+                            "[gas_station] Top-up delegating %s %.6f TRX (raw %d) to %s (remaining %d units)",
+                            resource, extra_sun / 1_000_000, extra_sun, invoice_address, remaining,
+                        )
+                        tx2 = (
+                            self.client.trx.delegate_resource(
+                                owner=owner_addr,
+                                receiver=invoice_address,
+                                balance=extra_sun,
+                                resource=resource,
+                            )
+                            .build()
+                            .sign(signing_pk)
+                        )
+                        res2 = tx2.broadcast()
+                        txid2 = res2.get("txid")
+                        for _ in range(10):
+                            time.sleep(2)
+                            after2 = self._get_account_resources(invoice_address)
+                            new2 = int(after2.get(res_key, 0))
+                            if new2 > new:
+                                logger.info("[gas_station] %s top-up observed on-chain: %d -> %d units", resource, new, new2)
+                                break
+                        else:
+                            if not txid2 or not self._wait_for_transaction(txid2, f"{resource} delegation top-up"):
+                                return False
+                return True
+
+            # ENERGY single-shot
+            if cfg.target_energy_units > 0 and cap_energy_trx > 0:
+                if not delegate_once(
+                    resource="ENERGY",
+                    target_units=tgt_energy,
+                    cap_trx=cap_energy_trx,
+                    units_per_trx=cfg.energy_units_per_trx_estimate,
+                ):
+                    return False
+
+            # BANDWIDTH single-shot
+            if cfg.target_bandwidth_units > 0 and cap_bw_trx > 0:
+                if not delegate_once(
+                    resource="BANDWIDTH",
+                    target_units=tgt_bw,
+                    cap_trx=cap_bw_trx,
+                    units_per_trx=cfg.bandwidth_units_per_trx_estimate,
+                ):
+                    return False
+
+            return True
+        except (requests.RequestException, ValueError, RuntimeError) as e:
+            logger.error("[gas_station] Resource delegation failed for %s: %s", invoice_address, e)
+            return False
 
 # Global gas station manager instance
 gas_station = GasStationManager()
 
 # Legacy functions for backward compatibility
+
 def prepare_for_sweep(invoice_address: str) -> bool:
     """Legacy function for backward compatibility"""
     return gas_station.prepare_for_sweep(invoice_address)
 
+
 def auto_activate_on_usdt_receive(invoice_address: str) -> bool:
-    """Legacy function for backward compatibility"""
-    return gas_station.auto_activate_on_usdt_receive(invoice_address)
+    """If address is not yet activated, prepare it for sweep; otherwise no-op.
+    Returns True if address is active or activation+delegation completed.
+    """
+    try:
+        acc = gas_station.client.get_account(invoice_address)
+        if acc:
+            return True
+    except (requests.RequestException, ValueError, RuntimeError):
+        # Treat lookup failure as not activated; will try to activate
+        pass
+    return prepare_for_sweep(invoice_address)
+
 
 def get_or_create_tron_deposit_address(db, seller_id: int, deposit_type: str = "TRX", xpub: str = None, account: int = None) -> str:
-    """Legacy function for backward compatibility"""
-    return gas_station.get_or_create_tron_deposit_address(db, seller_id, deposit_type, xpub, account)
+    """Return existing seller deposit address or create one if missing.
+    For now, use the gas wallet address as a shared deposit address if none exists.
+    """
+    try:
+        wal = get_seller_wallet(db, seller_id=seller_id, deposit_type=deposit_type)
+        if wal and wal.address:
+            return wal.address
+    except SQLAlchemyError:
+        wal = None
+    # Fallback: use gas wallet address as deposit address
+    try:
+        gas_addr = gas_station.get_gas_wallet_address()
+    except (ValueError, RuntimeError):
+        gas_addr = ""
+    try:
+        # Ensure a record exists
+        created = create_seller_wallet(
+            db,
+            seller_id=seller_id,
+            address=gas_addr,
+            derivation_path="",
+            deposit_type=deposit_type,
+            xpub=xpub or "",
+            account=account or 0,
+        )
+        return created.address
+    except SQLAlchemyError:
+        return gas_addr
+
 
 def calculate_trx_needed(seller) -> float:
-    """Legacy function for backward compatibility"""
-    return gas_station.calculate_trx_needed(seller)
+    """Heuristic recommendation for TRX deposit amount for gas operations."""
+    try:
+        cfg = config.tron
+        credited = 0.0
+        try:
+            credited = float(getattr(seller, 'gas_deposit_balance', 0) or 0.0)
+        except (TypeError, ValueError):
+            credited = 0.0
+        # Recommend enough for one activation and initial ENERGY/BW staking with some headroom,
+        # scaled up if credited balance is low
+        base = (cfg.auto_activation_amount * 2.0) + cfg.energy_delegation_amount + cfg.bandwidth_delegation_amount + 2.0
+        if credited < base / 2:
+            rec = base * 1.5
+        else:
+            rec = base
+        return round(float(rec), 2)
+    except (ValueError, RuntimeError):  # As a last resort, return a sensible default
+        return 50.0
