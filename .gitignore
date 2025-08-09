@@ -148,6 +148,29 @@ ENV/
 env.bak/
 venv.bak/
 
+# Environment backups and local config
+.env.bak*
+
+# ngrok artifacts
+ngrok.out
+ngrok.log
+ngrok.pid
+bin/
+
+# Logs and data (keep placeholders)
+logs/
+!logs/.gitkeep
+data/
+!data/.gitkeep
+bot.log
+
+# VS Code
+.vscode/
+
+# SQLite databases anywhere under data/
+# (root-level database.sqlite3 already ignored above)
+# data/**/*.sqlite3
+
 # Spyder project settings
 .spyderproject
 .spyproject

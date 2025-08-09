@@ -4,10 +4,10 @@ tronpy
 fastapi
 uvicorn[standard]
 sqlalchemy
-bip_utils
 qrcode
 python-dotenv
 pillow
+PyJWT>=2.8.0
 
 #tests
 pytest

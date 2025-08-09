@@ -28,12 +28,15 @@ else
 fi
 
 # Ensure data dir
-mkdir -p data
+mkdir -p data logs
+
+# Resolve API port (defaults to 8000)
+API_PORT="${API_PORT:-8000}"
 
 # Functions to run components
 start_api() {
-  echo "[api] starting FastAPI on :8000"
-  uvicorn src.api.v1.main:app --host 0.0.0.0 --port 8000 --reload
+  echo "[api] starting FastAPI on :$API_PORT"
+  uvicorn src.api.v1.main:app --host 0.0.0.0 --port "$API_PORT" --reload
 }
 
 start_bot() {
@@ -47,29 +50,69 @@ start_keeper() {
 }
 
 start_gasstation_cli() {
-  echo "[gasstation] starting CLI (status loop)"
-  python - <<'PY'
-import os, sys, time
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-from src.core.config import config
-from src.core.services.gasstation.gas_station_service import GasStationService
+  echo "[gasstation] starting status loop"
+  python -u - <<'PY'
+import time, signal, sys, logging
+from src.core.services.gas_station import gas_station
 
-gs = GasStationService(config.tron)
-while True:
-    try:
-        st = gs.get_status()
-        print("[gasstation]", st['network'], st['address'], f"bal={st['balance']:.2f}")
-    except Exception as e:
-        print("[gasstation][error]", e)
-    time.sleep(60)
+# Reduce noisy shutdown logs
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+stop = False
+
+def _stop(*_):
+    global stop
+    stop = True
+
+signal.signal(signal.SIGINT, _stop)
+signal.signal(signal.SIGTERM, _stop)
+
+try:
+    while not stop:
+        try:
+            health = gas_station.check_connection_health()
+            try:
+                addr = gas_station.get_gas_wallet_address()
+            except Exception:
+                addr = 'N/A'
+            print(f"[gasstation] node={health.get('node_type')} ok={health.get('connected')} block={health.get('latest_block')} lat={health.get('latency_ms')}ms addr={addr}", flush=True)
+        except Exception as e:
+            # Keep quiet on shutdown
+            if stop:
+                break
+            print("[gasstation][error]", e, flush=True)
+        # Sleep in small steps to react fast to signals
+        for _ in range(30):
+            if stop:
+                break
+            time.sleep(1)
+except KeyboardInterrupt:
+    pass
 PY
+}
+
+start_ngrok() {
+  echo "[ngrok] starting/refreshing tunnel to :$API_PORT"
+  # Ensure API_PORT in .env for the script to pick up
+  if grep -q '^API_PORT=' .env; then
+    sed -i "s#^API_PORT=.*#API_PORT=${API_PORT}#g" .env
+  else
+    echo "API_PORT=${API_PORT}" >> .env
+  fi
+  bash scripts/ngrok_v3_tunnel.sh || true
+  if [ -f ngrok.pid ]; then
+    NGROK_PID=$(cat ngrok.pid)
+    echo "[ngrok] pid=$NGROK_PID"
+  fi
+  if [ -f .env ]; then
+    echo "[ngrok] URLs in .env:" && grep -E '^(API_BASE_URL|SETUP_URL_BASE)=' .env || true
+  fi
 }
 
 # Supervisor: run components concurrently with logs
 run_all() {
+  local WANT_NGROK="${1:-auto}" # auto|force|off
   echo "[run] launching components"
-  # Create logs directory
-  mkdir -p logs
 
   # Start API
   start_api 2>&1 | tee logs/api.log &
@@ -87,9 +130,30 @@ run_all() {
   start_gasstation_cli 2>&1 | tee logs/gasstation.log &
   GAS_PID=$!
 
-  # Trap and cleanup
-  trap 'echo "[run] stopping"; kill $API_PID $KEEPER_PID $BOT_PID $GAS_PID 2>/dev/null || true; wait' INT TERM
-  echo "[run] PIDs: api=$API_PID keeper=$KEEPER_PID bot=$BOT_PID gas=$GAS_PID"
+  # Start ngrok if requested
+  NGROK_PID=""
+  if [ "$WANT_NGROK" = "force" ] || { [ "$WANT_NGROK" = "auto" ] && { [ -n "${NGROK_AUTHTOKEN:-}" ] || grep -q '^NGROK_AUTHTOKEN=' .env 2>/dev/null; }; }; then
+    # Delay slightly to let API initialize
+    sleep 1
+    start_ngrok
+  else
+    echo "[ngrok] skipped (no token or disabled)"
+  fi
+
+  cleanup() {
+    echo "[run] stopping"
+    for pid in $API_PID $KEEPER_PID $BOT_PID $GAS_PID ${NGROK_PID:-}; do
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 1
+    for pid in $API_PID $KEEPER_PID $BOT_PID $GAS_PID ${NGROK_PID:-}; do
+      kill -KILL "$pid" 2>/dev/null || true
+    done
+    wait
+  }
+  trap cleanup INT TERM
+
+  echo "[run] PIDs: api=$API_PID keeper=$KEEPER_PID bot=$BOT_PID gas=$GAS_PID ngrok=${NGROK_PID:-none}"
   wait
 }
 
@@ -98,21 +162,25 @@ usage() {
   cat <<EOF
 Usage: $0 <command>
 Commands:
-  all          Run API + Keeper + Bot + GasStation status loop (default)
-  api          Run FastAPI server only
-  bot          Run Telegram bot only
-  keeper       Run keeper bot only
-  gasstation   Run gas station status loop (debug)
+  all            Run API + Keeper + Bot + GasStation loop; auto-start ngrok if token present (default)
+  all-ngrok      Same as 'all' but force start ngrok tunnel
+  api            Run FastAPI server only
+  bot            Run Telegram bot only
+  keeper         Run keeper bot only
+  gasstation     Run gas station status loop (debug)
+  ngrok          Run ngrok tunnel setup/update only
 EOF
 }
 
 cmd=${1:-all}
 case "$cmd" in
-  all) run_all ;;
+  all) run_all auto ;;
+  all-ngrok) run_all force ;;
   api) start_api ;;
   bot) start_bot ;;
   keeper) start_keeper ;;
   gasstation) start_gasstation_cli ;;
+  ngrok) start_ngrok ;;
   *) usage ;;
 
 esac

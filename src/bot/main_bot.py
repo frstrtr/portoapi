@@ -1,5 +1,6 @@
 # Main entrance point to start Telegram-bot
 
+# pylint: disable=broad-except
 import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -19,13 +20,9 @@ from src.bot.handlers import seller_handlers, common_handlers
 from src.core.database.db_service import SessionLocal
 import functools
 
-# import signal
-from aiogram.fsm.state import State
-
 # --- DB auto-creation logic ---
 from src.core.database.db_service import engine, DATABASE_URL
 from src.core.database.models import Base
-import re
 
 # --- Logging setup ---
 logging.basicConfig(
@@ -39,9 +36,9 @@ logging.basicConfig(
 logger = logging.getLogger("bot")
 
 # Extract DB file path from DATABASE_URL
-logger.info(f"Full DATABASE_URL: {DATABASE_URL}")
+logger.info("Full DATABASE_URL: %s", DATABASE_URL)
 DB_PATH = DATABASE_URL.replace("sqlite:///", "")
-logger.info(f"Resolved DB_PATH: {DB_PATH}")
+logger.info("Resolved DB_PATH: %s", DB_PATH)
 if DB_PATH and not os.path.exists(DB_PATH):
     logger.info("Database file not found, creating tables...")
     Base.metadata.create_all(bind=engine)
@@ -58,13 +55,7 @@ bot.db = SessionLocal()
 
 
 def log_user_action(user: types.User, action: str, extra: str = ""):
-    logger.info(f"User {user.id} ({user.username}): action={action} {extra}")
-
-
-# --- Logging middleware for all messages ---
-# @dp.message()
-# async def log_message(message: types.Message, *args, **kwargs):
-#     log_user_action(message.from_user, "message", f"text='{message.text}'")
+    logger.info("User %s (%s): action=%s %s", user.id, user.username, action, extra)
 
 
 # Регистрация хендлеров с логированием
@@ -81,9 +72,7 @@ def log_and_handle(handler, action_name):
         )
         if unique_id is not None:
             if unique_id in wrapper.handled_updates:
-                logger.debug(
-                    f"[Deduplication] Skipping duplicate update/message: {unique_id}"
-                )
+                logger.debug("[Deduplication] Skipping duplicate update/message: %s", unique_id)
                 return
             wrapper.handled_updates.add(unique_id)
         log_user_action(message.from_user, action_name, f"text='{message.text}'")
@@ -94,12 +83,18 @@ def log_and_handle(handler, action_name):
             aiohttp.client_exceptions.ClientConnectorError,
         ) as net_err:
             logger.error(
-                f"[NetworkError] Handler '{action_name}' failed for user {message.from_user.id}: {net_err}"
+                "[NetworkError] Handler '%s' failed for user %s: %s",
+                action_name,
+                message.from_user.id,
+                net_err,
             )
             # Optionally, notify admins here if desired
         except Exception as e:
             logger.exception(
-                f"[HandlerError] Unexpected error in handler '{action_name}' for user {message.from_user.id}: {e}"
+                "[HandlerError] Unexpected error in handler '%s' for user %s: %s",
+                action_name,
+                message.from_user.id,
+                e,
             )
         # Do not re-raise, so bot continues processing other updates
 
@@ -219,6 +214,10 @@ async def main():
         lambda m: m.text == "/sweep",
     )
     dp.message.register(
+        log_and_handle(seller_handlers.handle_withdraw, "/withdraw"),
+        lambda m: m.text == "/withdraw",
+    )
+    dp.message.register(
         log_and_handle(seller_handlers.handle_buyers, "/buyers"),
         lambda m: m.text == "/buyers",
     )
@@ -260,6 +259,19 @@ async def main():
         log_and_handle(seller_handlers.process_sweep_mode_choice, "sweep_mode_choice"),
         seller_handlers.SweepFSM.choose_mode,
     )
+    # Register withdraw FSM handlers
+    dp.message.register(
+        log_and_handle(seller_handlers.process_withdraw_mode_choice, "withdraw_mode_choice"),
+        seller_handlers.WithdrawFSM.choose_mode,
+    )
+    dp.message.register(
+        log_and_handle(seller_handlers.process_withdraw_destination, "withdraw_destination"),
+        seller_handlers.WithdrawFSM.ask_destination,
+    )
+    dp.message.register(
+        log_and_handle(seller_handlers.process_withdraw_signed, "withdraw_signed"),
+        seller_handlers.WithdrawFSM.await_signed,
+    )
 
     max_retries = 10
     base_delay = 5  # seconds
@@ -267,7 +279,7 @@ async def main():
     notified_admins = False
     while True:
         try:
-            logger.info(f"Starting polling (attempt {attempt + 1})...")
+            logger.info("Starting polling (attempt %s)...", attempt + 1)
             await dp.start_polling(bot)
             break  # Exit loop if polling ends normally
         except (KeyboardInterrupt, asyncio.CancelledError):
@@ -280,7 +292,10 @@ async def main():
             attempt += 1
             delay = min(base_delay * (2 ** (attempt - 1)), 300)  # Cap at 5 min
             logger.error(
-                f"[RETRY] Network error: Cannot connect to Telegram API (attempt {attempt}/{max_retries}): {e}"
+                "[RETRY] Network error: Cannot connect to Telegram API (attempt %s/%s): %s",
+                attempt,
+                max_retries,
+                e,
             )
             print(
                 f"[ERROR] Cannot connect to Telegram API. Retry {attempt}/{max_retries} in {delay} seconds."
@@ -296,17 +311,19 @@ async def main():
                             )
                         except Exception as notify_err:
                             logger.error(
-                                f"Failed to notify admin {admin_id}: {notify_err}"
+                                "Failed to notify admin %s: %s",
+                                admin_id,
+                                notify_err,
                             )
                     notified_admins = True
                 except Exception as notify_outer:
-                    logger.error(f"Failed to notify admins: {notify_outer}")
+                    logger.error("Failed to notify admins: %s", notify_outer)
             if attempt >= max_retries:
-                logger.critical(f"Max retries ({max_retries}) reached. Stopping bot.")
+                logger.critical("Max retries (%s) reached. Stopping bot.", max_retries)
                 break
             await asyncio.sleep(delay)
         except Exception as e:
-            logger.exception(f"Unexpected error in polling: {e}")
+            logger.exception("Unexpected error in polling: %s", e)
             break
     await bot.session.close()
     logger.info("Bot stopped.")

@@ -1,24 +1,19 @@
-from aiogram.fsm.context import FSMContext
-
-
-# Обработчики всех команд продавца
-
-import logging
-import secrets
+# flake8: noqa
 from io import BytesIO
 import html
+import re
+import asyncio
+import logging
 
 import qrcode
 
 from aiogram.types.input_file import BufferedInputFile
-
 from aiogram import types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from src.core.database.db_service import (
     create_seller,
     get_seller,
-    get_wallet_by_group,
     create_invoice,
     get_invoices_by_seller,
     update_invoice,
@@ -26,8 +21,6 @@ from src.core.database.db_service import (
     get_buyer_groups_by_seller,
     create_buyer_group,
     get_wallets_by_seller,
-    create_seller_wallet,
-    update_seller,
     get_transactions_by_invoice,
 )
 
@@ -41,22 +34,16 @@ from src.core.services.gas_station import (
 # Import new gas station module
 from src.core.services.gasstation import (
     GasStationService,
-    GasStationManager,
-    format_resource_status,
-    analyze_resource_needs,
-    calculate_staking_efficiency,
 )
+from src.core.config import config  # Mini App base URL
 
 
-# pylint: disable=logging-fstring-interpolation
+# pylint: disable=logging-fstring-interpolation,broad-except
 
 
 # Import admin handlers
 # admin handler will show xPubs for admin users
-from src.bot.admin.admin_handlers import handle_admin_xpubs, is_admin
-
-# Import database service functions
-from src.core.database.db_service import get_wallets_by_seller
+# from src.bot.admin.admin_handlers import handle_admin_xpubs, is_admin  # unused
 
 from src.core.crypto.hd_wallet_service import generate_address_from_xpub
 
@@ -76,6 +63,7 @@ MAIN_COMMANDS = [
     "/buyers",
     "/add_buyer",
     "/sweep",
+    "/withdraw",
     "/invoices",
     "/gasstation",
     "/keeper_status",
@@ -109,6 +97,13 @@ class RegisterFSM(StatesGroup):
 # FSM для /sweep выбора режима
 class SweepFSM(StatesGroup):
     choose_mode = State()  # пользователь выбирает что именно вывести
+
+
+# FSM для /withdraw
+class WithdrawFSM(StatesGroup):
+    choose_mode = State()      # выбрать какие инвойсы выводить
+    ask_destination = State()  # спросить адрес назначения
+    await_signed = State()     # ожидание подписанных транзакций для броадкаста
 
 
 async def handle_main_command_interrupt(message: types.Message, state: FSMContext):
@@ -185,6 +180,9 @@ async def handle_myaccount(message: types.Message):
         # Get wallets information
         wallets = get_wallets_by_seller(db, telegram_id)
         if wallets:
+            # Personal wallet with derivation path m/44'/195'/{user_id}'/0/0
+            # May conflict with other wallets or buyer groups
+            # XXX better m/44'/195'/{user_id}'/{user_id}/0 - non standard change usage!!! but Unique
             user_info.append("\n🔑 <b>Дополнительные кошельки:</b>")
             for wallet in wallets:
                 if wallet.xpub:
@@ -332,8 +330,6 @@ async def process_choose_account_action(message: types.Message, state: FSMContex
 
 
 async def process_select_existing_account(message: types.Message, state: FSMContext):
-    telegram_id = message.from_user.id
-    db = message.bot.db
     account_info = message.text.strip()
     # Parse xPub and account
     try:
@@ -353,10 +349,13 @@ async def process_select_existing_account(message: types.Message, state: FSMCont
     return
 
 
-async def show_main_menu(message: types.Message, state: FSMContext = None):
+async def show_main_menu(message: types.Message, state: FSMContext | None = None):
     """
     Show the main actions keyboard to the user.
     """
+    # mark state as used to satisfy linters
+    if state is not None:
+        _ = state
     telegram_id = message.from_user.id
     db = message.bot.db
 
@@ -674,7 +673,7 @@ async def process_add_buyer_id(message: types.Message, state: FSMContext):
     await state.set_state(AddBuyerFSM.xpub)
 
 
-async def process_add_buyer_group(message: types.Message, state: FSMContext):
+async def process_add_buyer_group(_message: types.Message, _state: FSMContext):
     # No longer needed, merged with xpub step
     pass
 
@@ -795,7 +794,7 @@ async def handle_sweep(message: types.Message, state: FSMContext = None):
     def _fetch_invoice_tech_state(addr: str) -> dict:
         try:
             from src.core.config import config as _cfg
-            import requests
+            import requests  # local import
             from datetime import datetime, timezone
             base = _cfg.tron.get_tron_client_config().get("full_node")
             headers = {"Content-Type": "application/json"}
@@ -972,154 +971,250 @@ async def process_sweep_mode_choice(message: types.Message, state: FSMContext):
     await state.clear()
 
 
-async def process_register_xpub(message: types.Message, state: FSMContext):
+# --- Withdrawal helpers ---
+
+def _is_tron_address(addr: str) -> bool:
+    return isinstance(addr, str) and addr.startswith("T") and 26 <= len(addr) <= 36
+
+
+def _broadcast_signed_hex(hexstr: str) -> dict:
+    """Broadcast a signed TRON transaction hex via HTTP. Returns response dict."""
+    try:
+        from src.core.config import config as _cfg
+        import requests  # local import
+        base = _cfg.tron.get_tron_client_config().get("full_node") or _cfg.tron.get_fallback_client_config().get("full_node")
+        if not base:
+            raise RuntimeError("No TRON node endpoint configured")
+        headers = {"Content-Type": "application/json"}
+        payload = {"transaction": hexstr}
+        resp = requests.post(f"{base}/wallet/broadcasthex", json=payload, headers=headers, timeout=20)
+        return resp.json() if resp.ok else {"result": False, "error": resp.text}
+    except Exception as e:
+        return {"result": False, "error": str(e)}
+
+
+# --- Withdrawal FSM handlers ---
+async def handle_withdraw(message: types.Message, state: FSMContext):
+    """Start withdrawal flow: user chooses whether to include partial invoices."""
     telegram_id = message.from_user.id
-    text = message.text.strip()
-    logger.info(f"User {telegram_id} process_register_xpub: {text}")
-    if text.lower() == "нет":
-        await message.answer(
-            "Для генерации xPub используйте офлайн-страницу (xpub_offline.html) на вашем компьютере. Сгенерируйте xPub и отправьте его сюда. Никогда не делитесь seed-фразой или приватным ключом!"
-        )
-        await state.clear()
-        return
-    # Only validate xPub if the user is registering a new wallet, not when choosing an existing account
-    # If FSM state is RegisterFSM.get_xpub, validate xPub
-    current_state = await state.get_state()
-    if current_state == RegisterFSM.get_xpub.state:
-        xpub = text
-        if not is_valid_xpub(xpub):
-            logger.warning(f"User {telegram_id} provided invalid xPub: {xpub}")
-            await message.answer(
-                "Некорректный xPub. Пожалуйста, проверьте и отправьте корректный xPub."
-            )
-            return
     db = message.bot.db
-    buyers = get_buyer_groups_by_seller(db, telegram_id)
-    if not buyers:
-        # First xPub, assign to default buyer 'General' with account 0
-        create_buyer_group(
-            db,
-            seller_id=telegram_id,
-            buyer_id="General",
-            invoices_group=0,
-            xpub=xpub,
-        )
-        logger.info(
-            f"User {telegram_id} registered first xPub for default buyer 'General'"
-        )
-        await message.answer(
-            "Ваш xPub успешно зарегистрирован для покупателя 'General' (аккаунт 0)."
-        )
-        await show_main_menu(message, state)
+    # Reset FSM
+    prev = await state.get_state()
+    if prev:
         await state.clear()
-        return
-    # If buyers exist, ask user for buyer name or use next available account, with buttons
-    kb = types.ReplyKeyboardMarkup(
-        keyboard=[
-            [types.KeyboardButton(text="General")],
-            [types.KeyboardButton(text="Указать имя покупателя")],
-        ],
-        resize_keyboard=True,
-    )
-    await message.answer("Выберите действие для нового xPub:", reply_markup=kb)
-    await state.update_data(xpub=xpub)
-    await state.set_state("register_buyer_name")
 
-
-async def process_register_account(message: types.Message, state: FSMContext):
-    # This registration logic is now handled in process_register_xpub
-    pass
-    register_buyer_name = State()
-
-
-# --- Handler for /invoices command: show all invoices with details ---
-async def handle_invoices(message: types.Message):
-    telegram_id = message.from_user.id
-    logger.info(f"User {telegram_id} called /invoices")
-    db = message.bot.db
-    invoices = get_invoices_by_seller(db, telegram_id)
-    if not invoices:
-        await message.answer("У вас нет инвойсов.")
-        return
-    text = "Ваши инвойсы:\n"
+    invoices = get_invoices_by_seller(db=db, seller_id=telegram_id)
+    paid_invoices, partial_invoices = [], []
     for inv in invoices:
-        # Use buyer_group_id to lookup correct buyer group and account index
-        buyer_group_id = getattr(inv, "buyer_group_id", None)
-        buyer_group = None
-        if buyer_group_id is not None:
-            # get_buyer_groups_by_seller returns all groups, find by id
-            all_groups = get_buyer_groups_by_seller(db, telegram_id)
-            for g in all_groups:
-                if getattr(g, "id", None) == buyer_group_id:
-                    buyer_group = g
-                    break
-        account_index = (
-            getattr(buyer_group, "invoices_group", "-") if buyer_group else "-"
-        )
-        buyer_id = getattr(buyer_group, "buyer_id", "-") if buyer_group else "-"
-        address_index = getattr(inv, "derivation_index", "-")
-        derivation_path = (
-            f"m/44'/195'/{account_index}'/0/{address_index}"
-            if account_index != "-" and address_index != "-"
-            else "-"
-        )
-        # Calculate received/remaining via stored transactions
         try:
             txs = get_transactions_by_invoice(db, inv.id)
             total_received = sum(float(t.amount_received or 0) for t in txs)
         except Exception:
             total_received = 0.0
-        remaining = max(0.0, float(inv.amount) - total_received)
-        received_line = (
-            f"Получено: {total_received:.6f} USDT\nОсталось: {remaining:.6f} USDT\n"
-            if total_received > 0 else ""
+        amount_required = float(getattr(inv, "amount", 0) or 0)
+        if amount_required > 0 and total_received >= amount_required:
+            paid_invoices.append(inv)
+        elif total_received > 0:
+            partial_invoices.append(inv)
+
+    if not paid_invoices and not partial_invoices:
+        await message.answer("Нет оплаченных или частично оплаченных инвойсов для вывода.")
+        return
+
+    kb_rows = []
+    if paid_invoices:
+        kb_rows.append([types.KeyboardButton(text="Вывести только оплаченные")])
+    kb_rows.append([types.KeyboardButton(text="Вывести включая частичные")])
+    kb_rows.append([types.KeyboardButton(text="Отмена")])
+    kb = types.ReplyKeyboardMarkup(keyboard=kb_rows, resize_keyboard=True)
+
+    total_paid = sum(float(getattr(i, "amount", 0) or 0) for i in paid_invoices)
+    total_partial = 0.0
+    for inv in partial_invoices:
+        try:
+            txs = get_transactions_by_invoice(db, inv.id)
+            total_partial += sum(float(t.amount_received or 0) for t in txs)
+        except Exception:
+            pass
+
+    lines = ["Выберите режим вывода средств:"]
+    if paid_invoices:
+        lines.append(f"• Полностью оплачено: {len(paid_invoices)} на {total_paid:.2f} USDT")
+    if partial_invoices:
+        lines.append(f"• Частично оплачено: {len(partial_invoices)} на {total_partial:.2f} USDT")
+
+    await message.answer("\n".join(lines), reply_markup=kb)
+    # Offer Mini App signer as a one-click option
+    try:
+        import os
+        from urllib.parse import urlsplit
+        base = getattr(config, 'api', None)
+        configured = getattr(base, 'base_url', None) or "http://localhost:8000"
+        # Prefer explicit SETUP_URL_BASE if present in env
+        setup_base = os.getenv('SETUP_URL_BASE')
+        if setup_base:
+            root_base = setup_base.rstrip('/')
+        else:
+            parts = urlsplit(configured)
+            root_base = f"{parts.scheme}://{parts.netloc}"
+        miniapp_url = f"{root_base}/miniapp/?seller_id={telegram_id}"
+        ikb = types.InlineKeyboardMarkup(
+            inline_keyboard=[[types.InlineKeyboardButton(text="Открыть Mini App (подписать)", web_app=types.WebAppInfo(url=miniapp_url))]]
         )
-        text += (
-            f"\nID: {inv.id}\n"
-            f"Статус: {inv.status}\n"
-            f"Сумма: {inv.amount}\n"
-            f"{received_line}"
-            f"Адрес: {inv.address}\n"
-            f"Группа покупателя: {buyer_id}\n"
-            f"Индекс деривации: {address_index}\n"
-            f"Путь деривации: {derivation_path}\n"
-            f"Описание: {getattr(inv, 'description', '-') }\n"
-            f"Дата создания: {getattr(inv, 'created_at', '-') }\n"
-            "----------------------"
-        )
-    await message.answer(text)
+        await message.answer("Или используйте Mini App для подписи и отправки:", reply_markup=ikb)
+    except Exception:
+        pass
+
+    await state.set_state(WithdrawFSM.choose_mode)
+    await state.update_data(paid_ids=[i.id for i in paid_invoices], partial_ids=[i.id for i in partial_invoices])
 
 
-# # --- Admin command: /admin_xpubs <seller_id> ---
-# async def handle_admin_xpubs(message: types.Message):
-#     telegram_id = message.from_user.id
-#     if not is_admin(telegram_id):
-#         await message.answer("⛔️ Нет доступа. Только для админов.")
-#         return
-#     args = message.text.strip().split()
-#     if len(args) != 2:
-#         await message.answer("Использование: /admin_xpubs <seller_id>")
-#         return
-#     try:
-#         seller_id = int(args[1])
-#     except Exception:
-#         await message.answer("seller_id должен быть числом.")
-#         return
-#     db = message.bot.db
-#     from src.core.database.db_service import SessionLocal
+async def process_withdraw_mode_choice(message: types.Message, state: FSMContext):
+    choice = message.text.strip()
+    if choice.lower().startswith("отмена"):
+        from aiogram.types import ReplyKeyboardRemove
+        await message.answer("Операция отменена.", reply_markup=ReplyKeyboardRemove())
+        await show_main_menu(message, state)
+        await state.clear()
+        return
+    if choice not in {"Вывести только оплаченные", "Вывести включая частичные"}:
+        await message.answer("Пожалуйста, выберите вариант из клавиатуры.")
+        return
 
-#     wallets = (
-#         db.query(create_seller_wallet.__globals__["Wallet"])
-#         .filter_by(seller_id=seller_id)
-#         .all()
-#     )
-#     if not wallets:
-#         await message.answer(f"Нет xPub-кошельков для seller_id {seller_id}.")
-#         return
-#     text = f"xPubs для seller_id {seller_id}:\n"
-#     for w in wallets:
-#         text += f"- group: {w.invoices_group}, xpub: {w.xpub}\n"
-#     await message.answer(text)
+    data = await state.get_data()
+    paid_ids = data.get("paid_ids", [])
+    partial_ids = data.get("partial_ids", [])
+    include_partial = choice == "Вывести включая частичные"
+    selected_ids = paid_ids + (partial_ids if include_partial else [])
+
+    if not selected_ids:
+        from aiogram.types import ReplyKeyboardRemove
+        await message.answer("Нет выбранных инвойсов для вывода.", reply_markup=ReplyKeyboardRemove())
+        await state.clear()
+        return
+
+    await state.update_data(selected_invoice_ids=selected_ids)
+    from aiogram.types import ReplyKeyboardRemove
+    await message.answer(
+        "Укажите адрес назначения TRON (T...): все выбранные суммы USDT будут отправлены на этот адрес.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await state.set_state(WithdrawFSM.ask_destination)
+
+
+async def process_withdraw_destination(message: types.Message, state: FSMContext):
+    to_addr = message.text.strip()
+    if not _is_tron_address(to_addr):
+        await message.answer("Некорректный адрес TRON. Отправьте адрес, начинающийся с 'T'.")
+        return
+
+    db = message.bot.db
+    data = await state.get_data()
+    selected_ids = data.get("selected_invoice_ids", [])
+    invoices_index = {inv.id: inv for inv in get_invoices_by_seller(db, message.from_user.id)}
+
+    # Prepare unsigned TRC20 transfers
+    try:
+        from src.core.config import config
+        gs = GasStationService(config.tron)
+        contract = gs.tron.get_contract(gs.usdt_contract)
+    except Exception:
+        await message.answer("Ошибка инициализации TRON-клиента. Попробуйте позже.")
+        await state.clear()
+        return
+
+    pending = []
+    lines = [
+        "Сформированы транзакции для вывода USDT. Подпишите каждую приватным ключом адреса инвойса и пришлите в формате:",
+        "ID <invoice_id> <SIGNED_HEX>",
+    ]
+    for inv_id in selected_ids:
+        inv = invoices_index.get(inv_id)
+        if not inv:
+            continue
+        try:
+            txs = get_transactions_by_invoice(db, inv.id)
+            total_received = sum(float(t.amount_received or 0) for t in txs)
+        except Exception:
+            total_received = 0.0
+        amount_required = float(getattr(inv, "amount", 0) or 0)
+        amount_usdt = min(amount_required if amount_required > 0 else total_received, total_received)
+        if amount_usdt <= 0:
+            continue
+        amount_6 = int(round(amount_usdt * 1_000_000))
+        try:
+            txn = (
+                contract.functions.transfer(to_addr, amount_6)
+                .with_owner(inv.address)
+                .fee_limit(10_000_000)
+                .build()
+            )
+            # Store minimal reference for user-side signing
+            try:
+                tx_obj = txn.to_json()
+            except Exception:
+                tx_obj = getattr(txn, "raw_data", {})
+        except Exception:
+            continue
+        pending.append({"invoice_id": inv.id, "from": inv.address, "to": to_addr, "amount_usdt": amount_usdt, "tx": tx_obj})
+        short_addr = inv.address[:8] + "..." + inv.address[-6:]
+        lines.append(f"• ID {inv.id}: {amount_usdt:.6f} USDT с {short_addr} → {to_addr}")
+    if not pending:
+        await message.answer("Нет транзакций для подготовки вывода.")
+        await state.clear()
+        return
+
+    await state.update_data(pending_withdrawals=pending)
+    await message.answer("\n".join(lines))
+    await state.set_state(WithdrawFSM.await_signed)
+
+
+async def process_withdraw_signed(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower().startswith("отмена"):
+        await state.clear()
+        await show_main_menu(message, state)
+        return
+
+    data = await state.get_data()
+    pending = data.get("pending_withdrawals", [])
+    if not pending:
+        await message.answer("Нет ожидающих транзакций для отправки.")
+        await state.clear()
+        return
+
+    m = re.match(r"^ID\s+(\d+)\s+([0-9a-fA-F]+)$", text)
+    if not m:
+        await message.answer("Формат неверен. Используйте: ID <invoice_id> <SIGNED_HEX>")
+        return
+    inv_id = int(m.group(1))
+    signed_hex = m.group(2)
+
+    entry = next((p for p in pending if int(p.get("invoice_id")) == inv_id), None)
+    if not entry:
+        await message.answer("Неизвестный ID инвойса или он уже обработан.")
+        return
+
+    resp = _broadcast_signed_hex(signed_hex)
+    if not resp.get("result"):
+        err = resp.get("message") or resp.get("error") or str(resp)
+        await message.answer(f"❌ Ошибка отправки транзакции: {err}")
+        return
+
+    txid = resp.get("txid") or resp.get("transaction", {}).get("txID")
+    try:
+        update_invoice(db=message.bot.db, invoice_id=inv_id, status="withdrawn")
+    except Exception:
+        pass
+
+    pending = [p for p in pending if int(p.get("invoice_id")) != inv_id]
+    await state.update_data(pending_withdrawals=pending)
+    await message.answer(f"✅ Транзакция отправлена. TXID: {txid or '—'}")
+
+    if not pending:
+        await message.answer("Все подготовленные выводы обработаны.")
+        await state.clear()
+        await show_main_menu(message, state)
 
 
 # --- Help command handler ---
@@ -1194,78 +1289,55 @@ def register_sweep_handlers(dp, seller_handlers):
 async def handle_gasstation(message: types.Message):
     """Handle gas station status and management"""
     try:
-        # Use the same configuration as other services
         from src.core.config import config
-        
-        # Send initial message to show it's processing
         processing_msg = await message.answer("⏳ Getting gas station status...")
-        
         gas_station = GasStationService(config.tron)
-
-        # Get gas station status with timeout handling
-        import asyncio
         try:
-            # Run with a timeout to prevent hanging
-            status = await asyncio.wait_for(
-                asyncio.to_thread(gas_station.get_status), 
-                timeout=30.0
-            )
+            status = await asyncio.wait_for(asyncio.to_thread(gas_station.get_status), timeout=30.0)
         except asyncio.TimeoutError:
             await processing_msg.delete()
             await message.answer("❌ Gas station request timed out. TRON network connection might be slow. Please try again.")
             return
 
-        # Format the response
         response = "⛽ **Gas Station Status**\n\n"
         response += f"🏦 **Address:** `{status['address']}`\n"
         response += f"💰 **TRX Balance:** {status['balance']:.2f} TRX\n\n"
-
         response += "📊 **Staked Resources:**\n"
         if status["resources"]["energy"]["staked"] > 0:
             response += f"⚡ **Energy:** {status['resources']['energy']['staked']:,.0f} TRX\n"
-            response += (
-                f"   Available: {status['resources']['energy']['available']:,} units\n"
-            )
-
+            response += f"   Available: {status['resources']['energy']['available']:,} units\n"
         if status["resources"]["bandwidth"]["staked"] > 0:
             response += f"📡 **Bandwidth:** {status['resources']['bandwidth']['staked']:,.0f} TRX\n"
             response += f"   Available: {status['resources']['bandwidth']['available']:,} units\n"
-
         response += f"\n🔗 **Network:** {status['network']}\n"
         response += f"✅ **Status:** {'Online' if status.get('operational', {}).get('can_process_100_tx', False) else 'Offline'}\n"
-
-        # Add efficiency analysis
         try:
-            # Use the efficiency data already calculated in the status
             energy_eff = status.get("efficiency", {}).get("energy", 0)
             bandwidth_eff = status.get("efficiency", {}).get("bandwidth", 0)
-            avg_efficiency = (energy_eff + bandwidth_eff) / 2 if energy_eff or bandwidth_eff else 0
-            response += f"\n📈 **Efficiency:** {avg_efficiency:.1f}%\n"
+            avg_eff = (energy_eff + bandwidth_eff) / 2 if (energy_eff or bandwidth_eff) else 0
+            response += f"\n📈 **Efficiency:** {avg_eff:.1f}%\n"
         except Exception:
-            response += f"\n📈 **Efficiency:** Not available\n"
-
-        # Add management buttons
+            response += "\n📈 **Efficiency:** Not available\n"
         response += "\n🔧 **Management Commands:**\n"
         response += "• `/gasstation_stake` - Manage staking\n"
         response += "• `/gasstation_delegate` - Manage delegation\n"
         response += "• `/gasstation_withdraw` - Withdraw resources\n"
-
-        # Delete processing message and send result
         await processing_msg.delete()
         await message.answer(response, parse_mode="Markdown")
-
-    except ValueError as ve:
-        logger.error(f"Configuration error in gas station handler: {ve}")
+    except ValueError:
         if 'processing_msg' in locals():
-            await processing_msg.delete()
-        await message.answer("❌ Gas station configuration error. Please check if the gas wallet private key is set correctly.")
-    except Exception as e:
-        logger.error(f"Error in gas station handler: {e}")
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
+        await message.answer("❌ Gas station configuration error. Please check gas wallet config.")
+    except Exception:
         if 'processing_msg' in locals():
-            await processing_msg.delete()
-        await message.answer(
-            "❌ Error retrieving gas station status. The service might be connecting to TRON network. Please try again in a moment."
-        )
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
+        await message.answer("❌ Error retrieving gas station status. Try again later.")
 
 
 async def handle_keeper_status(message: types.Message):
@@ -1273,7 +1345,6 @@ async def handle_keeper_status(message: types.Message):
     try:
         # Check if keeper bot process is running by checking log activity
         import subprocess
-        import os
 
         keeper_running = False
 
@@ -1284,19 +1355,17 @@ async def handle_keeper_status(message: types.Message):
                 capture_output=True,
                 text=True,
                 timeout=5,
+                check=False,
             )
             keeper_running = bool(result.stdout.strip())
         except (subprocess.TimeoutExpired, FileNotFoundError):
             # Fallback: check recent log activity
             try:
-                import time
-
                 with open("bot.log", "r", encoding="utf-8") as f:
                     lines = f.readlines()
                     keeper_logs = [line for line in lines[-20:] if "keeper_bot" in line]
                     if keeper_logs:
                         # Check if last log is recent (within last 5 minutes)
-                        last_log = keeper_logs[-1]
                         # This is a simple heuristic - if we see recent logs, assume it's running
                         keeper_running = True
             except Exception:
@@ -1369,20 +1438,16 @@ async def handle_keeper_logs(message: types.Message):
             await message.answer("📝 No recent keeper bot logs found.")
             return
 
-        # Get last 10 log entries
         recent_logs = keeper_logs[-10:]
-
         response = "📋 **Recent Keeper Bot Logs:**\n\n"
         for log in recent_logs:
-            # Clean up the log line for display
             clean_log = log.strip()
             if len(clean_log) > 100:
-                clean_log = clean_log[:97] + "...";
-            response += f"`{clean_log}`\n";
+                clean_log = clean_log[:97] + "..."
+            response += f"`{clean_log}`\n"
 
-        response += f"\n📊 **Total entries:** {len(keeper_logs)}";
-
-        await message.answer(response, parse_mode="Markdown");
+        response += f"\n📊 **Total entries:** {len(keeper_logs)}"
+        await message.answer(response, parse_mode="Markdown")
 
     except Exception as e:
         logger.error(f"Error reading keeper logs: {e}")
@@ -1391,20 +1456,91 @@ async def handle_keeper_logs(message: types.Message):
 
 async def handle_gasstation_stake(message: types.Message):
     """Handle gas station staking management"""
-    # TODO: Implement staking management interface
     await message.answer("🚧 Gas station staking management coming soon!")
 
 
 async def handle_gasstation_delegate(message: types.Message):
     """Handle gas station delegation management"""
-    # TODO: Implement delegation management interface
     await message.answer("🚧 Gas station delegation management coming soon!")
 
 
 async def handle_gasstation_withdraw(message: types.Message):
     """Handle gas station withdrawal management"""
-    # TODO: Implement withdrawal management interface
     await message.answer("🚧 Gas station withdrawal management coming soon!")
+
+
+# --- Invoices list handler ---
+async def handle_invoices(message: types.Message):
+    telegram_id = message.from_user.id
+    db = message.bot.db
+    invoices = get_invoices_by_seller(db, telegram_id)
+    if not invoices:
+        await message.answer("У вас пока нет инвойсов.")
+        return
+    lines = ["Ваши инвойсы:"]
+    for inv in sorted(invoices, key=lambda i: getattr(i, 'id', 0))[:50]:
+        addr = getattr(inv, "address", "") or "—"
+        short = (addr[:8] + "..." + addr[-6:]) if addr and len(addr) > 16 else addr
+        lines.append(
+            f"• #{inv.id}: {getattr(inv, 'amount', 0)} USDT | статус: {getattr(inv, 'status', '—')} | {short}"
+        )
+    if len(invoices) > 50:
+        lines.append(f"… и ещё {len(invoices) - 50} инвойсов")
+    await message.answer("\n".join(lines))
+
+
+# --- Registration handlers (xPub flow) ---
+async def process_register_xpub(message: types.Message, state: FSMContext):
+    telegram_id = message.from_user.id
+    db = message.bot.db
+    xpub_text = (message.text or "").strip()
+
+    if xpub_text.lower() in {"/cancel", "отмена", "cancel"}:
+        await message.answer("Регистрация отменена.")
+        await state.clear()
+        return
+
+    if not is_valid_xpub(xpub_text):
+        await message.answer("Некорректный xPub. Отправьте корректный xPub или /cancel для отмены.")
+        return
+
+    # Choose next available account index
+    buyers = get_buyer_groups_by_seller(db, telegram_id)
+    used_accounts = set(b.invoices_group for b in buyers)
+    account = 0
+    while account in used_accounts:
+        account += 1
+
+    # Create default buyer group (General) with this xPub
+    buyer_id = "General" if not any(b.buyer_id == "General" for b in buyers) else f"General-{account}"
+    try:
+        create_buyer_group(
+            db,
+            seller_id=telegram_id,
+            buyer_id=buyer_id,
+            invoices_group=account,
+            xpub=xpub_text,
+        )
+    except Exception:
+        await message.answer("Ошибка при сохранении xPub. Попробуйте позже.")
+        return
+
+    await message.answer(f"xPub сохранён. Создан покупатель '{buyer_id}' (account {account}).")
+    await state.clear()
+    await show_main_menu(message, state)
+
+
+async def process_register_account(message: types.Message, state: FSMContext):
+    """Optional handler to accept custom account index, then ask for xPub"""
+    text = (message.text or "").strip()
+    try:
+        account = int(text)
+        await state.update_data(selected_account=account)
+        await message.answer(f"Выбран account {account}. Теперь отправьте xPub для этого аккаунта.")
+        await state.set_state(RegisterFSM.get_xpub)
+    except Exception:
+        await message.answer("Укажите номер аккаунта числом, например 0.")
+        return
 
 
 # Handler to cancel FSM state if main command is sent during an active FSM flow
