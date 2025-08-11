@@ -715,452 +715,681 @@ class GasStationManager:
             logger.info("[gas_station] BANDWIDTH yield fallback (exception): %d units/TRX", est)
             return est
 
-    def _ensure_minimum_resources_for_usdt(self, owner_addr: str, invoice_address: str, signing_pk: PrivateKey, activation_bonus_bw: int = 0, tx_budget_remaining: int = 3) -> bool:
-        """Ensure invoice address has enough ENERGY and BANDWIDTH to send 1 USDT transfer.
-        Rules:
-        - Consider activation_bonus_bw (e.g., 600) that may have been granted immediately after activation.
-        - Delegate BANDWIDTH if current available (including activation bonus) is below requirement, even for already-activated accounts.
-        - Delegate ENERGY if below requirement.
-        - Perform at most one tx per resource.
-        - After delegation, verify thresholds; return False if still insufficient.
+    def get_global_resource_parameters(self, probe_address: str | None = None) -> dict:
+        """Fetch global resource parameters from /wallet/getaccountresource for correct daily yield calculation."""
+        base = self.tron_config.get_tron_client_config().get("full_node")
+        if not base:
+            # Fallback to config estimates
+            return {
+                "totalEnergyLimit": 0,
+                "totalEnergyWeightSun": 0,
+                "totalEnergyWeightTrx": 0.0,
+                "totalNetLimit": 0,
+                "totalNetWeightSun": 0,
+                "totalNetWeightTrx": 0.0,
+                "dailyEnergyPerTrx": float(self.tron_config.energy_units_per_trx_estimate or 300.0),
+                "dailyBandwidthPerTrx": float(self.tron_config.bandwidth_units_per_trx_estimate or 1500.0),
+            }
+        addr = probe_address
+        if not addr:
+            try:
+                addr = self.get_gas_wallet_address()
+            except Exception:
+                addr = self.tron_config.usdt_contract
+        headers = {"Content-Type": "application/json"}
+        try:
+            r = requests.post(
+                f"{base}/wallet/getaccountresource",
+                json={"address": addr, "visible": True},
+                headers=headers,
+                timeout=6,
+            )
+            if not r.ok:
+                logger.warning("getaccountresource HTTP %s: %s", r.status_code, r.text[:120])
+                raise ValueError("Node did not return accountresource")
+            data = r.json() or {}
+            # Log full account resource response for diagnostics
+            self.last_account_resource_response = data
+            # Use capitalized keys from node response
+            total_energy_limit = int(data.get("TotalEnergyLimit", 0))
+            total_energy_weight_sun = int(data.get("TotalEnergyWeight", 0))
+            total_net_limit = int(data.get("TotalNetLimit", 0))
+            total_net_weight_sun = int(data.get("TotalNetWeight", 0))
+            # Use raw weight in SUN for per-TRX yield: limit / weightSun (weightSun already scaled by 1e6 relative to TRX)
+            total_energy_weight_trx = total_energy_weight_sun / 1_000_000.0 if total_energy_weight_sun else 0.0
+            total_net_weight_trx = total_net_weight_sun / 1_000_000.0 if total_net_weight_sun else 0.0
+            try:
+                daily_e_per_trx = float(total_energy_limit) / float(total_energy_weight_sun) if total_energy_weight_sun > 0 else float(self.tron_config.energy_units_per_trx_estimate or 300.0)
+            except Exception:
+                daily_e_per_trx = float(self.tron_config.energy_units_per_trx_estimate or 300.0)
+            try:
+                daily_bw_per_trx = float(total_net_limit) / float(total_net_weight_sun) if total_net_weight_sun > 0 else float(self.tron_config.bandwidth_units_per_trx_estimate or 1500.0)
+            except Exception:
+                daily_bw_per_trx = float(self.tron_config.bandwidth_units_per_trx_estimate or 1500.0)
+            if daily_e_per_trx < 0.1:
+                daily_e_per_trx = float(self.tron_config.energy_units_per_trx_estimate or 300.0)
+            if daily_bw_per_trx < 0.01:
+                daily_bw_per_trx = float(self.tron_config.bandwidth_units_per_trx_estimate or 1500.0)
+            params = {
+                "totalEnergyLimit": total_energy_limit,
+                "totalEnergyWeightSun": total_energy_weight_sun,
+                "totalEnergyWeightTrx": total_energy_weight_trx,
+                "totalNetLimit": total_net_limit,
+                "totalNetWeightSun": total_net_weight_sun,
+                "totalNetWeightTrx": total_net_weight_trx,
+                "dailyEnergyPerTrx": daily_e_per_trx,
+                "dailyBandwidthPerTrx": daily_bw_per_trx,
+            }
+            return params
+        except Exception as e:
+            logger.warning("Failed to fetch getaccountresource: %s", e)
+            # Fallback to config estimates
+            return {
+                "totalEnergyLimit": 0,
+                "totalEnergyWeightSun": 0,
+                "totalEnergyWeightTrx": 0.0,
+                "totalNetLimit": 0,
+                "totalNetWeightSun": 0,
+                "totalNetWeightTrx": 0.0,
+                "dailyEnergyPerTrx": float(self.tron_config.energy_units_per_trx_estimate or 300.0),
+                "dailyBandwidthPerTrx": float(self.tron_config.bandwidth_units_per_trx_estimate or 1500.0),
+            }
+
+    def estimate_daily_generation(self, stake_trx_energy: float = 0.0, stake_trx_bandwidth: float = 0.0, probe_address: str | None = None) -> dict:
+        """Estimate daily ENERGY and BANDWIDTH generation for given staked TRX amounts.
+        Uses global parameters from getaccountresource.
+        Returns dict: { energy_units, bandwidth_units, dailyEnergyPerTrx, dailyBandwidthPerTrx, network: {...} }
+        """
+        params = self.get_global_resource_parameters(probe_address)
+        # Log full chain parameters for diagnostics
+        try:
+            base = self.tron_config.get_tron_client_config().get("full_node")
+            r_chain = requests.get(f"{base}/wallet/getchainparameters", timeout=8)
+            logger.warning(f"[gas_station] Full chain parameters response: {r_chain.text}")
+        except Exception as e:
+            logger.warning(f"[gas_station] Error fetching chain parameters: {e}")
+        daily_e_per_trx = float(params.get("dailyEnergyPerTrx", 0.0) or 0.0)
+        daily_bw_per_trx = float(params.get("dailyBandwidthPerTrx", 0.0) or 0.0)
+        try:
+            e_units = int((float(stake_trx_energy or 0.0)) * daily_e_per_trx)
+        except Exception:
+            e_units = 0
+        try:
+            b_units = int((float(stake_trx_bandwidth or 0.0)) * daily_bw_per_trx)
+        except Exception:
+            b_units = 0
+        result = {
+            "energy_units": e_units,
+            "bandwidth_units": b_units,
+            "dailyEnergyPerTrx": daily_e_per_trx,
+            "dailyBandwidthPerTrx": daily_bw_per_trx,
+            "network": params,
+        }
+        logger.info(
+            "[gas_station] Daily generation estimate: stake ENERGY=%.3f TRX -> %d units/day (%.2f/unit/TRX), BANDWIDTH=%.3f TRX -> %d units/day (%.2f/unit/TRX)",
+            float(stake_trx_energy or 0.0), e_units, daily_e_per_trx,
+            float(stake_trx_bandwidth or 0.0), b_units, daily_bw_per_trx,
+        )
+        return result
+
+    def get_owner_delegated_stake(self) -> dict:
+        """Return the gas station owner's currently delegated + self (frozen) stake for ENERGY and BANDWIDTH in TRX.
+        Combines:
+          - Delegated stake from /wallet/getdelegatedresourceaccountindexv2 (fromAddress)
+          - Self stake (frozenV2) from /wallet/getaccount
         """
         try:
-            # Snapshot incoming delegations from gas wallet before any changes
-            prev_incoming = self._get_incoming_delegation_summary(invoice_address, owner_addr)
-            res = self._get_account_resources(invoice_address)
-            cur_energy = int(res.get("energy_available", 0))
-            cur_bw = max(0, int(res.get("bandwidth_available", 0)) + int(activation_bonus_bw or 0))
-            need_energy = max(0, int(self.tron_config.usdt_energy_per_transfer_estimate))
-            need_bw = max(0, int(self.tron_config.usdt_bandwidth_per_transfer_estimate))
+            owner = self.get_gas_wallet_address()
+        except Exception as e:
+            logger.warning("Cannot resolve gas wallet address: %s", e)
+            return {"energy_trx": 0.0, "bandwidth_trx": 0.0}
+        base = self.tron_config.get_tron_client_config().get("full_node")
+        if not base:
+            return {"energy_trx": 0.0, "bandwidth_trx": 0.0}
+        headers = {"Content-Type": "application/json"}
+        # --- Delegated stake ---
+        try:
+            r = requests.post(
+                f"{base}/wallet/getdelegatedresourceaccountindexv2",
+                json={"fromAddress": owner, "visible": True},
+                headers=headers,
+                timeout=8,
+            )
+            if not r.ok:
+                logger.warning("getdelegatedresourceaccountindexv2 HTTP %s: %s", r.status_code, r.text[:160])
+                delegated_data = {}
+            else:
+                delegated_data = r.json() or {}
+        except (requests.RequestException, ValueError) as e:
+            logger.warning("Failed getdelegatedresourceaccountindexv2: %s", e)
+            delegated_data = {}
+        energy_trx = 0.0
+        bandwidth_trx = 0.0
+        def _accumulate(obj):
+            nonlocal energy_trx, bandwidth_trx
+            if isinstance(obj, dict) and "delegatedResource" in obj:
+                _accumulate(obj["delegatedResource"])
+                return
+            if isinstance(obj, dict):
+                fe = obj.get("frozen_balance_for_energy")
+                fb = obj.get("frozen_balance_for_bandwidth")
+                res = obj.get("resource")
+                if fe is not None:
+                    try:
+                        energy_trx += int(fe) / 1_000_000.0
+                    except Exception:
+                        pass
+                elif res == "ENERGY":
+                    try:
+                        bal = int(obj.get("balance", 0) or 0)
+                        energy_trx += bal / 1_000_000.0
+                    except Exception:
+                        pass
+                if fb is not None:
+                    try:
+                        bandwidth_trx += int(fb) / 1_000_000.0
+                    except Exception:
+                        pass
+                elif res == "BANDWIDTH":
+                    try:
+                        bal = int(obj.get("balance", 0) or 0)
+                        bandwidth_trx += bal / 1_000_000.0
+                    except Exception:
+                        pass
+            elif isinstance(obj, list):
+                for it in obj:
+                    _accumulate(it)
+        _accumulate(delegated_data)
+        # --- Self stake (frozen) ---
+        try:
+            r_acc = requests.post(
+                f"{base}/wallet/getaccount",
+                json={"address": owner, "visible": True},
+                headers=headers,
+                timeout=8,
+            )
+            if r_acc.ok:
+                acc = r_acc.json() or {}
+                # frozenV2: [{"type":"ENERGY","amount":SUN}, {"type":"BANDWIDTH","amount":SUN}, ...]
+                frozen_v2 = acc.get("frozenV2") or []
+                if isinstance(frozen_v2, list):
+                    # Stake 2.0 pattern sometimes places an initial untyped object with only amount -> BANDWIDTH
+                    first_untyped_used = False
+                    for fr in frozen_v2:
+                        try:
+                            f_type_raw = fr.get("type") or fr.get("Type") or fr.get("resource")
+                            # Skip placeholders like {"type":"TRON_POWER"}
+                            if f_type_raw == "TRON_POWER":
+                                continue
+                            amount_sun_val = fr.get("amount") or fr.get("Amount")
+                            try:
+                                amount_sun = int(amount_sun_val) if amount_sun_val is not None else 0
+                            except (TypeError, ValueError):
+                                amount_sun = 0
+                            amount_trx = amount_sun / 1_000_000.0
+                            if f_type_raw:
+                                f_type = f_type_raw.upper()
+                                if f_type == "ENERGY":
+                                    energy_trx += amount_trx
+                                elif f_type == "BANDWIDTH":
+                                    bandwidth_trx += amount_trx
+                            else:
+                                # Untyped – treat first positive amount as BANDWIDTH stake (observed Nile pattern)
+                                if not first_untyped_used and amount_trx > 0:
+                                    bandwidth_trx += amount_trx
+                                    first_untyped_used = True
+                        except Exception:  # pragma: no cover - defensive
+                            continue
+                # Legacy 'frozen' structure (single balance) – cannot split, ignore to avoid mis-attribution
+            else:
+                logger.warning("getaccount HTTP %s: %s", r_acc.status_code, r_acc.text[:160])
+        except (requests.RequestException, ValueError) as e:
+            logger.warning("Failed getaccount for self stake: %s", e)
+        # Clamp to zero if negative
+        energy_trx = max(0.0, energy_trx)
+        bandwidth_trx = max(0.0, bandwidth_trx)
+        logger.info(
+            "[gas_station] Total stake (delegated + self): ENERGY=%.3f TRX, BANDWIDTH=%.3f TRX", energy_trx, bandwidth_trx
+        )
+        return {"energy_trx": energy_trx, "bandwidth_trx": bandwidth_trx}
 
-            miss_e = max(0, need_energy - cur_energy)
-            miss_bw = max(0, need_bw - cur_bw)
-            # Rough TRX estimates using configured yields
-            est_e_trx = (miss_e / float(max(1, int(self.tron_config.energy_units_per_trx_estimate)))) if miss_e > 0 else 0.0
-            # Prefer live dynamic yield for bandwidth if available
-            try:
-                bw_yield_units = int(self._estimate_bandwidth_units_per_trx())
-            except Exception:
-                bw_yield_units = 0
-            if not bw_yield_units or bw_yield_units <= 0:
+    def estimate_owner_daily_generation(self, probe_address: str | None = None) -> dict:
+        """Estimate daily generation from (delegated + self) stake; no longer misinterprets resource limits as TRX."""
+        stake = self.get_owner_delegated_stake()
+        energy_trx = float(stake.get("energy_trx", 0.0) or 0.0)
+        bandwidth_trx = float(stake.get("bandwidth_trx", 0.0) or 0.0)
+        result = self.estimate_daily_generation(
+            stake_trx_energy=energy_trx,
+            stake_trx_bandwidth=bandwidth_trx,
+            probe_address=probe_address,
+        )
+        if energy_trx == 0.0 and bandwidth_trx == 0.0:
+            result["warning"] = "Stake appears zero (no delegated or self frozen). Verify account stake (frozenV2) and delegation status."
+        return result
+
+    # ------------------------------------------------------------
+    # Stake + Generation Summary (mirrors enhanced test math)
+    # ------------------------------------------------------------
+    def get_owner_stake_generation_summary(self, probe_address: str | None = None, *, include_raw: bool = False, scale_1e6: bool = True) -> dict:
+        """Return a comprehensive summary of owner's stake (ENERGY + BANDWIDTH) and expected daily generation.
+
+        Data sources:
+          - Delegated + self stake parsed via get_owner_delegated_stake (delegated resources + /wallet/getaccount frozenV2)
+          - Global daily yields derived from /wallet/getaccountresource (correct formula limit/weight)
+
+        Parameters:
+          probe_address: optional override for getaccountresource probe
+          include_raw: include raw fetched structures (accountresource + global params)
+          scale_1e6: include human-scaled daily generation (divide by 1e6 for readability)
+
+        Returns dict with keys:
+          energy_trx, bandwidth_trx, dailyEnergyPerTrx, dailyBandwidthPerTrx,
+          expected_energy_units, expected_bandwidth_units,
+          (optional) expected_energy_units_m, expected_bandwidth_units_m,
+          (optional) raw { 'global_params': ..., 'accountresource': ... }
+        """
+        stake = self.get_owner_delegated_stake()
+        energy_trx = float(stake.get("energy_trx", 0.0) or 0.0)
+        bandwidth_trx = float(stake.get("bandwidth_trx", 0.0) or 0.0)
+        params = self.get_global_resource_parameters(probe_address)
+        daily_e_per_trx = float(params.get("dailyEnergyPerTrx", 0.0) or 0.0)
+        daily_bw_per_trx = float(params.get("dailyBandwidthPerTrx", 0.0) or 0.0)
+        try:
+            expected_energy_units = int(energy_trx * daily_e_per_trx)
+        except Exception:
+            expected_energy_units = 0
+        try:
+            expected_bandwidth_units = int(bandwidth_trx * daily_bw_per_trx)
+        except Exception:
+            expected_bandwidth_units = 0
+        # Fetch current liquid balance & reward info (best-effort)
+        available_trx = 0.0
+        reward_trx = 0.0
+        try:
+            base = self.tron_config.get_tron_client_config().get("full_node")
+            owner_addr = self.get_gas_wallet_address()
+            # Balance
+            r_acc = requests.post(
+                f"{base}/wallet/getaccount", json={"address": owner_addr, "visible": True}, timeout=6
+            )
+            if r_acc.ok:
+                acc_data = r_acc.json() or {}
                 try:
-                    bw_yield_units = int(self.tron_config.bandwidth_units_per_trx_estimate)
+                    available_trx = float(int(acc_data.get("balance", 0)) / 1_000_000.0)
+                except Exception:  # pragma: no cover
+                    available_trx = 0.0
+            # Rewards (separate endpoint per TRON docs)
+            try:
+                r_reward = requests.post(
+                    f"{base}/wallet/getReward", json={"address": owner_addr, "visible": True}, timeout=6
+                )
+                if r_reward.ok:
+                    reward_data = r_reward.json() or {}
+                    reward_trx = float(int(reward_data.get("reward", 0)) / 1_000_000.0)
+            except Exception:  # pragma: no cover
+                reward_trx = 0.0
+        except Exception:  # pragma: no cover
+            available_trx = 0.0
+            reward_trx = 0.0
+        total_staked_trx = energy_trx + bandwidth_trx
+        summary: dict[str, object] = {
+            "energy_trx": energy_trx,
+            "bandwidth_trx": bandwidth_trx,
+            "dailyEnergyPerTrx": daily_e_per_trx,
+            "dailyBandwidthPerTrx": daily_bw_per_trx,
+            "expected_energy_units": expected_energy_units,
+            "expected_bandwidth_units": expected_bandwidth_units,
+            "available_trx": round(available_trx, 6),
+            "total_staked_trx": round(total_staked_trx, 6),
+            "stake_rewards_trx": round(reward_trx, 6),
+        }
+        if scale_1e6:
+            summary["expected_energy_units_m"] = expected_energy_units / 1_000_000.0
+            summary["expected_bandwidth_units_m"] = expected_bandwidth_units / 1_000_000.0
+        if include_raw:
+            raw = {"global_params": params}
+            # Attach last_account_resource_response if captured
+            if hasattr(self, "last_account_resource_response"):
+                raw["accountresource"] = getattr(self, "last_account_resource_response")
+            summary["raw"] = raw
+        return summary
+
+    def _b58_to_hex(self, addr: str) -> str | None:
+        """Convert TRON base58 address (T...) to hex (41...); returns lowercase hex string or None."""
+        base = self.tron_config.get_tron_client_config().get("full_node")
+        if not base or not addr:
+            return None
+        try:
+            r = requests.post(
+                f"{base}/wallet/validateaddress",
+                json={"address": addr, "visible": True},
+                timeout=5,
+            )
+            if r.ok:
+                j = r.json() or {}
+                hx = j.get("hexAddress") or j.get("hex_address")
+                if isinstance(hx, str) and hx:
+                    return hx.lower()
+        except requests.RequestException:
+            return None
+        return None
+
+    def _get_chain_fee_params(self) -> dict:
+        """Fetch chain fee parameters: energy and bandwidth burn costs in SUN."""
+        base = self.tron_config.get_tron_client_config().get("full_node")
+        if not base:
+            return {"getEnergyFee": None, "getTransactionFee": None}
+        try:
+            r = requests.get(f"{base}/wallet/getchainparameters", timeout=5)
+            if not r.ok:
+                return {"getEnergyFee": None, "getTransactionFee": None}
+            data = r.json() or {}
+            params = data.get("chainParameter") or data.get("chain_parameter") or []
+            fees = {"getEnergyFee": None, "getTransactionFee": None}
+            for p in params:
+                k = (p.get("key") or "").strip()
+                try:
+                    v = int(p.get("value"))
                 except Exception:
-                    bw_yield_units = 500
-            est_bw_trx = (miss_bw / float(max(1, int(bw_yield_units)))) if miss_bw > 0 else 0.0
+                    try:
+                        v = int(float(p.get("value")))
+                    except Exception:
+                        v = None
+                if k == "getEnergyFee":
+                    fees["getEnergyFee"] = v
+                elif k == "getTransactionFee":
+                    fees["getTransactionFee"] = v
+            return fees
+        except (requests.RequestException, ValueError):
+            return {"getEnergyFee": None, "getTransactionFee": None}
+
+    def estimate_usdt_transfer_resources(self, from_address: str, to_address: str | None = None, amount_usdt: float = 1.0) -> dict:
+        """Simulate USDT transfer to estimate energy and bandwidth usage and potential burn cost.
+        Returns dict with keys: energy_used, bandwidth_used, cost_sun, cost_trx, fees {getEnergyFee, getTransactionFee}.
+        """
+        base = self.tron_config.get_tron_client_config().get("full_node")
+        if not base or not from_address:
+            return {"energy_used": 0, "bandwidth_used": 0, "cost_sun": 0, "cost_trx": 0.0, "fees": {}}
+        if not to_address:
+            try:
+                to_address = self.get_gas_wallet_address()
+            except Exception:
+                to_address = self.tron_config.usdt_contract  # last resort, still valid address
+        # Encode parameters per ABI: address (20 bytes without 0x41) + uint256 amount
+        to_hex = self._b58_to_hex(to_address) or ""
+        if to_hex.startswith("41"):
+            to_hex_20 = to_hex[2:]
+        else:
+            to_hex_20 = to_hex
+        to_hex_20 = (to_hex_20 or "").lower().zfill(64)
+        try:
+            amount_smallest = int(round(float(amount_usdt) * 1_000_000))
+        except (TypeError, ValueError):
+            amount_smallest = 1_000_000
+        amount_hex = hex(amount_smallest)[2:].lower().zfill(64)
+        encoded_parameter = to_hex_20 + amount_hex
+        payload = {
+            "owner_address": from_address,
+            "contract_address": self.tron_config.usdt_contract,
+            "function_selector": "transfer(address,uint256)",
+            "parameter": encoded_parameter,
+            "visible": True,
+            "call_value": 0,
+        }
+        energy_used = 0
+        net_usage = 0
+        try:
+            r = requests.post(f"{base}/wallet/triggerconstantcontract", json=payload, timeout=8)
+            if r.ok:
+                j = r.json() or {}
+                try:
+                    energy_used = int(j.get("energy_used", 0) or 0)
+                except (TypeError, ValueError):
+                    energy_used = 0
+                # Bandwidth/bytes
+                try:
+                    net_usage = int(j.get("transaction", {}).get("net_usage", 0) or 0)
+                except (TypeError, ValueError):
+                    net_usage = int(j.get("net_usage", 0) or 0) if isinstance(j.get("net_usage", 0), int) else 0
+        except (requests.RequestException, ValueError):
+            energy_used = 0
+            net_usage = 0
+        # Fee calculation
+        fees = self._get_chain_fee_params()
+        e_fee = fees.get("getEnergyFee") or 0
+        b_fee = fees.get("getTransactionFee") or 0
+        try:
+            total_sun = int(energy_used) * int(e_fee) + int(net_usage) * int(b_fee)
+        except (TypeError, ValueError):
+            total_sun = 0
+        return {
+            "energy_used": int(energy_used),
+            "bandwidth_used": int(net_usage),
+            "cost_sun": int(total_sun),
+            "cost_trx": float(total_sun) / 1_000_000.0,
+            "fees": fees,
+        }
+
+    def _delegate_resources(
+        self,
+        owner_addr: str,
+        receiver_addr: str,
+        signing_pk: PrivateKey,
+        *,
+        target_energy_units: int = 0,
+        target_bandwidth_units: int = 0,
+        include_energy: bool = True,
+        include_bandwidth: bool = True,
+        tx_budget_remaining: int = 2,
+    ) -> None:
+        """Delegate ENERGY/BANDWIDTH from owner to receiver using dynamic targets.
+        Uses tronpy freeze_balance with receiver to perform one-shot delegations.
+        """
+        if tx_budget_remaining <= 0:
+            return
+        # Recompute current to know actual missing units
+        res = self._get_account_resources(receiver_addr)
+        cur_e = int(res.get("energy_available", 0))
+        cur_bw = int(res.get("bandwidth_available", 0))
+        miss_e = max(0, int(target_energy_units or 0) - cur_e)
+        miss_bw = max(0, int(target_bandwidth_units or 0) - cur_bw)
+        # Nothing to do
+        if miss_e <= 0 and miss_bw <= 0:
+            return
+        # Units per TRX estimates
+        try:
+            e_yield = float(max(1, int(self.tron_config.energy_units_per_trx_estimate)))
+        except (TypeError, ValueError):
+            e_yield = 300.0
+        try:
+            bw_yield = float(max(1, int(self._estimate_bandwidth_units_per_trx())))
+        except (TypeError, ValueError):
+            try:
+                bw_yield = float(max(1, int(self.tron_config.bandwidth_units_per_trx_estimate)))
+            except (TypeError, ValueError):
+                bw_yield = 1500.0
+        # Policy min/max per single delegation
+        try:
+            min_trx = float(getattr(self.tron_config, "min_delegate_trx", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            min_trx = 1.0
+        try:
+            max_energy_trx = float(getattr(self.tron_config, "energy_delegation_amount", 3.0) or 3.0)
+        except (TypeError, ValueError):
+            max_energy_trx = 3.0
+        try:
+            max_bw_trx = float(getattr(self.tron_config, "bandwidth_delegation_amount", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            max_bw_trx = 1.0
+
+        # Helper to send a delegation by freezing with receiver
+        def _freeze_and_wait(amount_trx: float, resource: str) -> bool:
+            if amount_trx <= 0:
+                return True
+            amt_sun = int(round(amount_trx * 1_000_000))
+            try:
+                txn = (
+                    self.client.trx.freeze_balance(
+                        owner_addr,
+                        amt_sun,
+                        duration=3,
+                        resource=resource,
+                        receiver=receiver_addr,
+                    )
+                    .build()
+                    .sign(signing_pk)
+                )
+                result = txn.broadcast()
+                txid = result.get("txid") or result.get("txID")
+                if not txid:
+                    return False
+                return self._wait_for_transaction(txid, f"{resource} delegation", max_attempts=25)
+            except (RuntimeError, ValueError) as e:
+                logger.error("[gas_station] %s delegation failed via freeze_balance: %s", resource, e)
+                return False
+
+        # ENERGY delegation first (more critical for USDT transfer)
+        if include_energy and miss_e > 0 and tx_budget_remaining > 0:
+            need_trx = miss_e / e_yield
+            amount_trx = max(min_trx, need_trx)
+            if max_energy_trx > 0:
+                amount_trx = min(amount_trx, max_energy_trx)
             logger.info(
-                "[gas_station] Resource check for %s: E %d/%d (missing %d ~ %.2f TRX), BW %d/%d (missing %d ~ %.6f TRX)",
-                invoice_address,
-                cur_energy,
-                need_energy,
+                "[gas_station] Delegating ENERGY ~%.3f TRX to %s (missing %d units, yield≈%.1f/unit)",
+                amount_trx,
+                receiver_addr,
                 miss_e,
-                est_e_trx,
-                cur_bw,
-                need_bw,
+                e_yield,
+            )
+            if _freeze_and_wait(amount_trx, "ENERGY"):
+                tx_budget_remaining -= 1
+            else:
+                logger.warning("[gas_station] ENERGY delegation attempt failed")
+        # BANDWIDTH delegation second
+        if include_bandwidth and miss_bw > 0 and tx_budget_remaining > 0:
+            need_trx = miss_bw / bw_yield
+            amount_trx = max(min_trx, need_trx)
+            if max_bw_trx > 0:
+                amount_trx = min(amount_trx, max_bw_trx)
+            logger.info(
+                "[gas_station] Delegating BANDWIDTH ~%.3f TRX to %s (missing %d units, yield≈%.1f/unit)",
+                amount_trx,
+                receiver_addr,
                 miss_bw,
-                est_bw_trx,
+                bw_yield,
+            )
+            if _freeze_and_wait(amount_trx, "BANDWIDTH"):
+                tx_budget_remaining -= 1
+            else:
+                logger.warning("[gas_station] BANDWIDTH delegation attempt failed")
+
+    def _ensure_minimum_resources_for_usdt(
+        self,
+        owner_addr: str,
+        target_addr: str,
+        signing_pk,
+        *,
+        activation_bonus_bw: int = 0,
+        tx_budget_remaining: int = 2,
+    ) -> bool:
+        """Ensure target address has enough ENERGY & BANDWIDTH for a single USDT transfer.
+        1) Read current resources.
+        2) Simulate a transfer to estimate usage (fallback to config/defaults if simulation fails).
+        3) Delegate missing resources (ENERGY first) within remaining tx budget.
+        Returns True if after (possible) delegation resources satisfy requirement, else False.
+        """
+        try:
+            # Current resources
+            cur = self._get_account_resources(target_addr)
+            cur_e = int(cur.get("energy_available", 0) or 0)
+            cur_bw = int(cur.get("bandwidth_available", 0) or 0)
+
+            # Simulate USDT transfer (from target to gas wallet)
+            sim = self.estimate_usdt_transfer_resources(from_address=target_addr, to_address=owner_addr, amount_usdt=1.0)
+            used_e = int(sim.get("energy_used", 0) or 0)
+            used_bw = int(sim.get("bandwidth_used", 0) or 0)
+
+            # Fallbacks if simulation yields zeros
+            if used_e <= 0:
+                used_e = int(getattr(self.tron_config, "usdt_energy_estimate", 50000) or 50000)
+            if used_bw <= 0:
+                used_bw = int(getattr(self.tron_config, "usdt_bandwidth_estimate", 350) or 350)
+
+            # Safety buffers
+            safety_e = int(max(3000, used_e * 0.15))
+            safety_bw = int(max(50, used_bw * 0.25))
+            required_e = used_e + safety_e
+            required_bw = used_bw + safety_bw
+
+            # Account for activation free bandwidth just granted
+            effective_bw = cur_bw + int(activation_bonus_bw or 0)
+
+            missing_e = max(0, required_e - cur_e)
+            missing_bw = max(0, required_bw - effective_bw)
+
+            logger.info(
+                "[gas_station] Resource check for %s: curE=%d curBW=%d(+%d bonus) needE=%d needBW=%d (missE=%d missBW=%d)",
+                target_addr,
+                cur_e,
+                cur_bw,
+                activation_bonus_bw,
+                required_e,
+                required_bw,
+                missing_e,
+                missing_bw,
             )
 
-            # If already sufficient, nothing to do
-            if cur_energy >= need_energy and cur_bw >= need_bw:
-                logger.info("[gas_station] Resources already sufficient for USDT transfer at %s (E=%d, BW=%d)", invoice_address, cur_energy, cur_bw)
+            # If nothing missing, done
+            if missing_e <= 0 and missing_bw <= 0:
                 return True
 
-            # Build targets equal to requirements; we will delegate only once per resource
-            target_energy = need_energy
-            # Delegate bandwidth if still below requirement (include activation bonus in cur_bw)
-            perform_bandwidth = (cur_bw < need_bw)
-            target_bw = need_bw if perform_bandwidth else 0
+            # If we cannot sign (e.g., test fake signer), skip delegation but allow proceed only if existing suffices
+            if not isinstance(signing_pk, PrivateKey):
+                logger.warning("[gas_station] Signer is not a PrivateKey; cannot delegate resources.")
+                return missing_e <= 0 and missing_bw <= 0
 
+            # Delegate as needed
             self._delegate_resources(
                 owner_addr,
-                invoice_address,
+                target_addr,
                 signing_pk,
-                target_energy_units=target_energy,
-                target_bandwidth_units=target_bw,
-                include_energy=(cur_energy < need_energy),
-                include_bandwidth=perform_bandwidth,
-                tx_budget_remaining=max(0, int(tx_budget_remaining)),
+                target_energy_units=required_e,
+                target_bandwidth_units=required_bw,
+                include_energy=missing_e > 0,
+                include_bandwidth=missing_bw > 0,
+                tx_budget_remaining=tx_budget_remaining,
             )
-            # In tests with a mocked Tron client, resource counters won't update; accept success after delegations
-            try:
-                from unittest.mock import MagicMock as _MM  # type: ignore
-            except Exception:
-                _MM = None
-            if _MM is not None and isinstance(self.client, _MM):
-                logger.info("[gas_station] Test environment detected (mocked Tron client); accepting delegation success without strict post-check")
-                return True
-            # Strict post-check: verify thresholds regardless of delegate() return
-            res2 = self._get_account_resources(invoice_address)
-            e2 = int(res2.get("energy_available", 0))
-            b2 = max(0, int(res2.get("bandwidth_available", 0)) + int(activation_bonus_bw or 0))
-            if not (e2 >= need_energy and b2 >= need_bw):
-                # Allow a short propagation window for resource indexes to catch up
-                logger.info(
-                    "[gas_station] Waiting briefly for resources to propagate (have E=%d/BW=%d; need E>=%d/BW>=%d)",
-                    e2,
-                    b2,
-                    need_energy,
-                    need_bw,
-                )
-                deadline = time.time() + 10
-                while time.time() < deadline and not (e2 >= need_energy and b2 >= need_bw):
-                    time.sleep(2)
-                    res2 = self._get_account_resources(invoice_address)
-                    e2 = int(res2.get("energy_available", 0))
-                    b2 = max(0, int(res2.get("bandwidth_available", 0)) + int(activation_bonus_bw or 0))
-            if e2 >= need_energy and b2 >= need_bw:
-                logger.info("[gas_station] Resources sufficient after delegation at %s (E=%d, BW=%d)", invoice_address, e2, b2)
-                return True
-            else:
-                # As a last confirmation path, if delegatedresourcev2 shows a recorded incoming delegation
-                # from the owner that should satisfy requirements (based on yield estimates), accept success.
-                cur_incoming = self._get_incoming_delegation_summary(invoice_address, owner_addr)
-                try:
-                    delta_e_sun = max(0, int(cur_incoming.get("energy", 0)) - int(prev_incoming.get("energy", 0)))
-                    delta_b_sun = max(0, int(cur_incoming.get("bandwidth", 0)) - int(prev_incoming.get("bandwidth", 0)))
-                except (TypeError, ValueError):
-                    delta_e_sun = 0
-                    delta_b_sun = 0
-                delta_e_trx = float(delta_e_sun) / 1_000_000.0
-                delta_b_trx = float(delta_b_sun) / 1_000_000.0
-                try:
-                    e_yield = float(max(1, int(self.tron_config.energy_units_per_trx_estimate)))
-                except (TypeError, ValueError):
-                    e_yield = 300.0
-                # Prefer dynamic bandwidth yield from chain parameters
-                by = self._estimate_bandwidth_units_per_trx()
-                try:
-                    b_yield = float(max(1, int(by if by and by > 0 else self.tron_config.bandwidth_units_per_trx_estimate)))
-                except (TypeError, ValueError):
-                    b_yield = 500.0
-                e2_pred = e2 + int(round(delta_e_trx * e_yield))
-                b2_pred = b2 + int(round(delta_b_trx * b_yield))
-                if e2_pred >= need_energy and b2_pred >= need_bw:
-                    logger.info(
-                        "[gas_station] Resources predicted sufficient based on recorded delegations (E=%d→%d, BW=%d→%d)",
-                        e2,
-                        e2_pred,
-                        b2,
-                        b2_pred,
-                    )
-                    return True
-                # Additional acceptance: if bandwidth shortfall was small enough that our enforced
-                # minimum single-shot (>=1 TRX) should cover it by estimate, accept success to avoid
-                # flakiness due to counter lag on some nodes.
-                try:
-                    min_trx = float(getattr(self.tron_config, "min_delegate_trx", 1.0) or 1.0)
-                    if min_trx < 1.0:
-                        min_trx = 1.0
-                except (TypeError, ValueError):
-                    min_trx = 1.0
-                # If we planned a BANDWIDTH delegation (perform_bandwidth) and the estimate indicated
-                # <= min_trx was sufficient, accept predicted success based on yield alone.
-                try:
-                    perform_bandwidth = (cur_bw < need_bw)
-                except Exception:
-                    perform_bandwidth = True
-                bw_predicted_from_min = b2 + int(round(min_trx * b_yield))
-                if (
-                    perform_bandwidth
-                    and est_bw_trx > 0
-                    and est_bw_trx <= min_trx
-                    and bw_predicted_from_min >= need_bw
-                    and e2 >= need_energy
-                ):
-                    logger.warning(
-                        "[gas_station] Accepting success: 1 TRX BANDWIDTH delegation should cover shortfall by dynamic estimate (have BW=%d, need %d, yield≈%d/unit)",
-                        b2,
-                        need_bw,
-                        int(b_yield),
-                    )
-                    return True
+
+            # Re-check after delegation (include activation bonus again)
+            post = self._get_account_resources(target_addr)
+            post_e = int(post.get("energy_available", 0) or 0)
+            post_bw = int(post.get("bandwidth_available", 0) or 0) + int(activation_bonus_bw or 0)
+
+            ok = (post_e >= required_e * 0.9) and (post_bw >= required_bw * 0.9)
+            if not ok:
                 logger.warning(
-                    "[gas_station] Resources still insufficient after delegation at %s (need E>=%d/BW>=%d, have E=%d/BW=%d; predicted E=%d/BW=%d)",
-                    invoice_address,
-                    need_energy,
-                    need_bw,
-                    e2,
-                    b2,
-                    e2_pred,
-                    b2_pred,
+                    "[gas_station] Post-delegation resources still low for %s: E=%d/%d BW=%d/%d",
+                    target_addr,
+                    post_e,
+                    required_e,
+                    post_bw,
+                    required_bw,
                 )
-                return False
-        except (requests.RequestException, ValueError, RuntimeError) as e:
-            logger.error("[gas_station] Failed ensuring minimum resources for USDT at %s: %s", invoice_address, e)
-            return False
-
-    def _delegate_resources(self, owner_addr: str, invoice_address: str, signing_pk: PrivateKey,
-                            target_energy_units: int | None = None,
-                            target_bandwidth_units: int | None = None,
-                            include_energy: bool = True,
-                            include_bandwidth: bool = False,
-                            tx_budget_remaining: int = 3) -> bool:
-        """Delegate ENERGY and BANDWIDTH up to targets in at most one tx per resource.
-        No top-up transactions. BANDWIDTH is optional and performed before ENERGY when required.
-        """
-        try:
-            cfg = self.tron_config
-            cap_energy_trx = max(0.0, cfg.max_energy_delegation_trx_per_invoice)
-            cap_bw_trx = max(0.0, cfg.max_bandwidth_delegation_trx_per_invoice)
-
-            # Resolve dynamic targets
-            tgt_energy = int(target_energy_units) if target_energy_units is not None else int(cfg.target_energy_units)
-            tgt_bw = int(target_bandwidth_units) if target_bandwidth_units is not None else int(cfg.target_bandwidth_units)
-
-            # Helper to perform a single delegation tx for a given resource
-            def delegate_once(resource: str, target_units: int, cap_trx: float, units_per_trx: int,
-                              observe_timeout_sec: int = 24,
-                              optimistic_return: bool = False) -> tuple[bool, bool]:
-                res_key = "energy_available" if resource == "ENERGY" else "bandwidth_available"
-                before = self._get_account_resources(invoice_address)
-                current = int(before.get(res_key, 0))
-                # Also capture incoming delegation summary from owner
-                prev_summary = self._get_incoming_delegation_summary(invoice_address, owner_addr)
-                prev_e = prev_summary.get("energy", 0)
-                prev_b = prev_summary.get("bandwidth", 0)
-                prev_c = prev_summary.get("count", 0)
-
-                missing = max(0, target_units - current)
-                if missing <= 0:
-                    logger.info("[gas_station] %s target met for %s (current=%d >= target=%d)", resource, invoice_address, current, target_units)
-                    return True, False
-
-                # Compute needed TRX using estimate and clamp to caps; enforce TRON minimum >= 1 TRX for both resources
-                if resource == "BANDWIDTH":
-                    # Prefer live chain parameter-based yield if available
-                    dyn = self._estimate_bandwidth_units_per_trx()
-                    if dyn and dyn > 0:
-                        units_per_trx = dyn
-                if units_per_trx <= 0:
-                    # Use sane fallbacks instead of silently skipping
-                    logger.warning(
-                        "[gas_station] Invalid units_per_trx estimate for %s (%r). Applying fallback default.",
-                        resource,
-                        units_per_trx,
-                    )
-                    if resource == "ENERGY":
-                        units_per_trx = cfg.energy_units_per_trx_estimate or 300
-                    else:
-                        # Conservative fallback for bandwidth to avoid over-acceptance
-                        units_per_trx = (self._estimate_bandwidth_units_per_trx() or cfg.bandwidth_units_per_trx_estimate or 500)
-                    if units_per_trx <= 0:
-                        units_per_trx = 300 if resource == "ENERGY" else 500
-                # Apply safety multiplier so a single shot exceeds thresholds
-                safety_mult = getattr(cfg, "delegation_safety_multiplier", 1.1)
-                try:
-                    safety_mult = float(safety_mult)
-                except (TypeError, ValueError):
-                    safety_mult = 1.1
-                safety_mult = min(max(safety_mult, 1.0), 1.5)
-                needed_trx = (missing / float(units_per_trx)) * safety_mult
-                # Enforce TRON minimum delegate amount >= 1 TRX for both ENERGY and BANDWIDTH
-                min_trx = getattr(cfg, "min_delegate_trx", 1.0)
-                try:
-                    min_trx = float(min_trx)
-                except (TypeError, ValueError):
-                    min_trx = 1.0
-                if min_trx < 1.0:
-                    min_trx = 1.0
-                needed_trx = max(min_trx, needed_trx)
-                needed_trx = min(needed_trx, cap_trx)
-                if needed_trx < 1.0:
-                    logger.error(
-                        "[gas_station] %s delegation cannot proceed: cap %.6f TRX is below network minimum (1 TRX)",
-                        resource,
-                        cap_trx,
-                    )
-                    return False, False
-                amount_sun = max(1, int(round(needed_trx, 6) * 1_000_000))
-
-                logger.info(
-                    "[gas_station] Single-shot delegating %s %.6f TRX (raw %d) to %s (missing %d units, est %d/unit, safety x%.2f)",
-                    resource, amount_sun / 1_000_000, amount_sun, invoice_address, missing, units_per_trx, safety_mult,
-                )
-                try:
-                    tx = (
-                        self.client.trx.delegate_resource(
-                            owner=owner_addr,
-                            receiver=invoice_address,
-                            balance=amount_sun,
-                            resource=resource,
-                        )
-                        .build()
-                        .sign(signing_pk)
-                    )
-                    result = tx.broadcast()
-                except Exception as be:  # noqa: BLE001 - surface unexpected delegate/broadcast issues
-                    logger.error("[gas_station] %s delegation broadcast raised: %s", resource, be)
-                    return False
-                # If node responds with explicit failure, log and abort early
-                try:
-                    ok_flag = bool(result.get("result", True))
-                except Exception:
-                    ok_flag = True
-                if not ok_flag:
-                    msg = result.get("message") or result.get("error") or result
-                    code = result.get("code") or ""
-                    logger.error(
-                        "[gas_station] %s delegation broadcast failed: code=%s message=%s", resource, code, msg
-                    )
-                    return False, False
-                txid = result.get("txid")
-
-                # Prefer observing effect: resources or incoming delegation entries from owner
-                deadline = time.time() + max(0, int(observe_timeout_sec))
-                while time.time() < deadline:
-                    time.sleep(2)
-                    after = self._get_account_resources(invoice_address)
-                    new = int(after.get(res_key, 0))
-                    if new > current:
-                        logger.info("[gas_station] %s delegation observed on-chain: %d -> %d units", resource, current, new)
-                        break
-                    # Check incoming delegation registry change
-                    cur_summary = self._get_incoming_delegation_summary(invoice_address, owner_addr)
-                    cur_e = cur_summary.get("energy", 0)
-                    cur_b = cur_summary.get("bandwidth", 0)
-                    cur_c = cur_summary.get("count", 0)
-                    if (cur_c > prev_c) or (cur_e > prev_e) or (cur_b > prev_b):
-                        logger.info("[gas_station] %s delegation detected via delegatedresourcev2 (owner->invoice)", resource)
-                        break
-                else:
-                    # Quick tx lookup; otherwise proceed optimistically if requested
-                    if txid and self._wait_for_transaction(txid, f"{resource} delegation", max_attempts=6):
-                        pass
-                    elif optimistic_return:
-                        logger.warning("[gas_station] Proceeding optimistically after %s delegation; no confirmation within %ss",
-                                       resource, observe_timeout_sec)
-                        return True, True
-                    else:
-                        return False, True
-
-                # No top-up: single-shot only
-                return True, True
-
-            # Execute up to one tx per resource; don't abort early due to transient confirmation flakiness.
-            bw_ok = True
-            en_ok = True
-            # Clamp budget to sane bounds
-            try:
-                budget = max(0, int(tx_budget_remaining))
-            except (TypeError, ValueError):
-                budget = 3
-
-            # BANDWIDTH single-shot first if enabled and required
-            logger.info(
-                "[gas_station] BANDWIDTH include=%s, target=%d, cap=%.6f",
-                include_bandwidth,
-                tgt_bw,
-                cap_bw_trx,
-            )
-            if include_bandwidth and tgt_bw > 0 and cap_bw_trx > 0:
-                logger.info(
-                    "[gas_station] BANDWIDTH delegation planned: include=%s, target=%d, cap=%.6f, est=%d/unit",
-                    include_bandwidth,
-                    tgt_bw,
-                    cap_bw_trx,
-                    cfg.bandwidth_units_per_trx_estimate,
-                )
-                try:
-                    bw_ok, used_bw_tx = delegate_once(
-                        resource="BANDWIDTH",
-                        target_units=tgt_bw,
-                        cap_trx=cap_bw_trx,
-                        units_per_trx=cfg.bandwidth_units_per_trx_estimate,
-                        observe_timeout_sec=24,
-                        optimistic_return=False,
-                    )
-                    budget -= 1 if used_bw_tx else 0
-                    logger.info("[gas_station] BANDWIDTH delegation result: %s", bw_ok)
-                except Exception as ex:  # noqa: BLE001 - ensure ENERGY still runs
-                    logger.error("[gas_station] BANDWIDTH delegation raised: %s", ex)
-                    bw_ok = False
-                    used_bw_tx = False
-                if not bw_ok:
-                    logger.warning("[gas_station] BANDWIDTH delegation did not confirm; evaluating single retry within tx budget")
-                    # Single retry for BANDWIDTH if budget allows after reserving ENERGY
-                    reserve_for_energy = 1 if include_energy and tgt_energy > 0 and cap_energy_trx > 0 else 0
-                    if budget - reserve_for_energy >= 1:
-                        try:
-                            logger.info("[gas_station] Retrying BANDWIDTH delegation once (budget=%d, reserved_for_energy=%d)", budget, reserve_for_energy)
-                            # On retry, cap at 1 TRX to avoid overshooting invoice cap
-                            retry_cap = min(1.0, cap_bw_trx)
-                            bw_ok, used_bw_retry = delegate_once(
-                                resource="BANDWIDTH",
-                                target_units=tgt_bw,
-                                cap_trx=retry_cap,
-                                units_per_trx=cfg.bandwidth_units_per_trx_estimate,
-                                observe_timeout_sec=20,
-                                optimistic_return=True,
-                            )
-                            budget -= 1 if used_bw_retry else 0
-                            logger.info("[gas_station] BANDWIDTH retry result: %s", bw_ok)
-                        except Exception as rex:  # noqa: BLE001
-                            logger.error("[gas_station] BANDWIDTH retry raised: %s", rex)
-                            bw_ok = False
-                    else:
-                        logger.info("[gas_station] Skipping BANDWIDTH retry to honor 3-tx cap (budget=%d, reserved_for_energy=%d)", budget, reserve_for_energy)
             else:
                 logger.info(
-                    "[gas_station] BANDWIDTH delegation skipped: include=%s, target=%d, cap=%.6f",
-                    include_bandwidth,
-                    tgt_bw,
-                    cap_bw_trx,
+                    "[gas_station] Post-delegation resources sufficient for %s: E=%d BW=%d (required E=%d BW=%d)",
+                    target_addr,
+                    post_e,
+                    post_bw,
+                    required_e,
+                    required_bw,
                 )
-
-            # ENERGY single-shot
-            logger.info(
-                "[gas_station] ENERGY include=%s, target=%d, cap=%.6f",
-                include_energy,
-                tgt_energy,
-                cap_energy_trx,
-            )
-            if include_energy and tgt_energy > 0 and cap_energy_trx > 0:
-                logger.info(
-                    "[gas_station] ENERGY delegation planned: include=%s, target=%d, cap=%.6f, est=%d/unit",
-                    include_energy,
-                    tgt_energy,
-                    cap_energy_trx,
-                    cfg.energy_units_per_trx_estimate,
-                )
-                try:
-                    en_ok, used_en_tx = delegate_once(
-                        resource="ENERGY",
-                        target_units=tgt_energy,
-                        cap_trx=cap_energy_trx,
-                        units_per_trx=cfg.energy_units_per_trx_estimate,
-                        observe_timeout_sec=12,
-                        optimistic_return=True,
-                    )
-                    budget -= 1 if used_en_tx else 0
-                    logger.info("[gas_station] ENERGY delegation result: %s", en_ok)
-                except Exception as ex:  # noqa: BLE001
-                    logger.error("[gas_station] ENERGY delegation raised: %s", ex)
-                    en_ok = False
-                if not en_ok:
-                    logger.warning("[gas_station] ENERGY delegation did not confirm yet; relying on final post-check")
-            else:
-                logger.info(
-                    "[gas_station] ENERGY delegation skipped: include=%s, target=%d, cap=%.6f",
-                    include_energy,
-                    tgt_energy,
-                    cap_energy_trx,
-                )
-            summary_ok = (not include_bandwidth or bw_ok) and (not include_energy or en_ok)
-            logger.info(
-                "[gas_station] Delegation summary: include_bw=%s bw_ok=%s | include_energy=%s en_ok=%s => %s",
-                include_bandwidth,
-                bw_ok,
-                include_energy,
-                en_ok,
-                summary_ok,
-            )
-            return summary_ok
-        except (requests.RequestException, ValueError, RuntimeError) as e:
-            logger.error("[gas_station] Resource delegation failed for %s: %s", invoice_address, e)
+            return ok
+        except Exception as e:
+            logger.error("[gas_station] ensure_minimum_resources_for_usdt error: %s", e)
             return False
 
-# Global gas station manager instance
+# Global gas station instance
 gas_station = GasStationManager()
 
 # Legacy functions for backward compatibility
@@ -1242,3 +1471,16 @@ def calculate_trx_needed(seller) -> float:
         return round(float(rec), 2)
     except (ValueError, RuntimeError):  # As a last resort, return a sensible default
         return 50.0
+
+# Convenience wrappers
+
+def estimate_daily_resource_generation(stake_trx_energy: float = 0.0, stake_trx_bandwidth: float = 0.0, probe_address: str | None = None) -> dict:
+    return gas_station.estimate_daily_generation(stake_trx_energy, stake_trx_bandwidth, probe_address)
+
+def estimate_gasstation_daily_resource_generation(probe_address: str | None = None) -> dict:
+    """Module-level helper to estimate daily generation for the gas station owner."""
+    return gas_station.estimate_owner_daily_generation(probe_address)
+
+def estimate_usdt_transfer_consumption(from_address: str, to_address: str | None = None, amount_usdt: float = 1.0) -> dict:
+    """Module-level helper that simulates a USDT transfer for live resource usage & cost."""
+    return gas_station.estimate_usdt_transfer_resources(from_address, to_address, amount_usdt)

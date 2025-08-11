@@ -10,6 +10,7 @@ try:
         BuyerGroup,
         FreeGasUsage,
         Base,
+        FreeGasAddress,
     )
 except ImportError:
     from src.core.database.models import (
@@ -21,10 +22,12 @@ except ImportError:
     BuyerGroup,
     FreeGasUsage,
     Base,
+    FreeGasAddress,
     )
 import os
 import logging
 from typing import Optional
+from datetime import datetime, timezone
 
 
 logger = logging.getLogger(__name__)
@@ -301,16 +304,101 @@ def delete_gas_station(db, gs_id):
 
 # --- FREE GAS USAGE CRUD ---
 def get_free_gas_usage(db, seller_id):
-    return db.query(FreeGasUsage).filter(FreeGasUsage.seller_id == seller_id).first()
+    """Return today's Free Gas usage record for the given seller_id.
+    If a record exists but last update was on a previous day, reset the counter to 0 for today.
+    """
+    rec = db.query(FreeGasUsage).filter(FreeGasUsage.seller_id == seller_id).first()
+    now = datetime.now(timezone.utc)
+    if rec:
+        try:
+            last = rec.updated_at or now
+            # Compare dates in UTC; if day changed, reset counter
+            if last.date() != now.date():
+                rec.used_count = 0
+                rec.updated_at = now
+                db.commit()
+                db.refresh(rec)
+        except Exception:
+            # On any parsing error, keep as-is
+            pass
+    return rec
 
 
 def increment_free_gas_usage(db, seller_id) -> int:
-    rec = get_free_gas_usage(db, seller_id)
+    """Increment today's Free Gas usage counter and return today's used_count.
+    Ensures the Seller row exists for unregistered users.
+    Resets the counter if day changed.
+    """
+    # Ensure Seller exists (supports unregistered users using Free Gas)
+    try:
+        seller = db.query(Seller).filter(Seller.telegram_id == seller_id).first()
+        if not seller:
+            seller = Seller(telegram_id=seller_id)
+            db.add(seller)
+            db.commit()
+            db.refresh(seller)
+    except Exception:
+        # Best-effort; in SQLite without FK enforcement this is fine
+        pass
+
+    rec = db.query(FreeGasUsage).filter(FreeGasUsage.seller_id == seller_id).first()
+    now = datetime.now(timezone.utc)
     if not rec:
-        rec = FreeGasUsage(seller_id=seller_id, used_count=1)
+        rec = FreeGasUsage(seller_id=seller_id, used_count=1, updated_at=now)
         db.add(rec)
     else:
-        rec.used_count = int(rec.used_count or 0) + 1
+        try:
+            last = rec.updated_at or now
+            if last.date() != now.date():
+                rec.used_count = 1  # first use today
+            else:
+                rec.used_count = int(rec.used_count or 0) + 1
+            rec.updated_at = now
+        except Exception:
+            rec.used_count = int(rec.used_count or 0) + 1
+            rec.updated_at = now
     db.commit()
     db.refresh(rec)
     return rec.used_count
+
+
+def reset_free_gas_usage_today(db, seller_id: int) -> int:
+    """Reset today's Free Gas usage for the seller to 0 and return the new value (0).
+    Useful after a successful top-up to restore daily shots.
+    """
+    now = datetime.now(timezone.utc)
+    rec = db.query(FreeGasUsage).filter(FreeGasUsage.seller_id == seller_id).first()
+    if not rec:
+        rec = FreeGasUsage(seller_id=seller_id, used_count=0, updated_at=now)
+        db.add(rec)
+    else:
+        rec.used_count = 0
+        rec.updated_at = now
+    db.commit()
+    db.refresh(rec)
+    return rec.used_count
+
+
+# --- FREE GAS ADDRESSES CRUD ---
+def record_free_gas_address(db, telegram_id: int, address: str):
+    """Insert or update a record of a TRON address submitted for Free Gas by a user.
+    Increment uses and update last_used_at if it already exists.
+    """
+    rec = (
+        db.query(FreeGasAddress)
+        .filter(FreeGasAddress.telegram_id == telegram_id, FreeGasAddress.address == address)
+        .first()
+    )
+    now = datetime.now(timezone.utc)
+    if not rec:
+        rec = FreeGasAddress(telegram_id=telegram_id, address=address, uses=1, created_at=now, last_used_at=now)
+        db.add(rec)
+    else:
+        rec.uses = int(rec.uses or 0) + 1
+        rec.last_used_at = now
+    db.commit()
+    return rec
+
+
+def list_free_gas_addresses(db, telegram_id: int):
+    return db.query(FreeGasAddress).filter(FreeGasAddress.telegram_id == telegram_id).all()

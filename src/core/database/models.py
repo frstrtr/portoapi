@@ -104,6 +104,19 @@ class FreeGasUsage(Base):
     seller = relationship("Seller")
 
 
+class FreeGasAddress(Base):
+    __tablename__ = "free_gas_addresses"
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, nullable=False, index=True)
+    address = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
+    last_used_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
+    uses = Column(Integer, default=1)
+    __table_args__ = (
+        UniqueConstraint("telegram_id", "address", name="uix_freegas_user_addr"),
+    )
+
+
 class Wallet(Base):
     __tablename__ = "wallets"
     id = Column(Integer, primary_key=True)

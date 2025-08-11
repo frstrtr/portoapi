@@ -221,6 +221,10 @@ async def main():
         lambda m: m.text == "/balance",
     )
     dp.message.register(
+        log_and_handle(seller_handlers.handle_restore_free_gas, "/restore_free_gas"),
+        lambda m: m.text == "/restore_free_gas",
+    )
+    dp.message.register(
         log_and_handle(seller_handlers.handle_create_invoice, "/create_invoice"),
         lambda m: m.text == "/create_invoice",
     )
@@ -295,6 +299,10 @@ async def main():
     dp.message.register(
         log_and_handle(seller_handlers.process_free_gas_confirm, "free_gas_confirm"),
         seller_handlers.FreeGasFSM.confirm_topup,
+    )
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_estimate_usdt, "/estimate_usdt"),
+        lambda m: m.text == "/estimate_usdt",
     )
 
     max_retries = 10
