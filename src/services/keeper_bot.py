@@ -11,6 +11,9 @@ from tronpy.keys import PrivateKey
 import sys
 import os
 import re
+from queue import Queue, Empty
+from threading import Thread
+from dataclasses import dataclass
 
 # Add project root to Python path
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,6 +24,8 @@ from src.core.database.models import Invoice, Wallet
 from src.core.services.gas_station import auto_activate_on_usdt_receive
 from src.core.config import config
 from bip_utils import Bip44, Bip44Coins, Bip44Changes, Bip39SeedGenerator
+import importlib as _importlib
+_SELF_MODULE = _importlib.import_module(__name__)
 
 # Setup logging
 logging.basicConfig(
@@ -33,6 +38,105 @@ logging.basicConfig(
 )
 logger = logging.getLogger("keeper_bot")
 
+# --- Lightweight background activation queue (threaded) ---
+
+@dataclass
+class ActivationJob:
+    invoice_id: int
+    address: str
+    retries_left: int = 3
+    backoff_sec: float = 5.0
+
+
+class ActivationJobQueue:
+    """Simple thread-based queue to run activation+delegation asynchronously.
+    Avoids blocking the main keeper loop when nodes are slow to confirm/poll.
+    """
+
+    def __init__(self, worker_count: int = 1, default_retries: int = 3, backoff_sec: float = 5.0):
+        self.q: Queue = Queue()
+        self._in_flight: set[int] = set()  # invoice_ids in progress
+        self._workers: list[Thread] = []
+        self.sync_mode: bool = False  # when True, run jobs immediately in caller thread
+        self._default_retries = default_retries
+        self._default_backoff = backoff_sec
+        for i in range(max(1, worker_count)):
+            t = Thread(target=self._worker, name=f"activation-worker-{i}", daemon=True)
+            t.start()
+            self._workers.append(t)
+
+    def enqueue(self, job: ActivationJob):
+        if job.invoice_id in self._in_flight:
+            return
+        if self.sync_mode:
+            # Run immediately in caller thread for deterministic tests
+            self._in_flight.add(job.invoice_id)
+            try:
+                self._handle_job(job)
+            finally:
+                self._in_flight.discard(job.invoice_id)
+        else:
+            # Fill defaults if not provided
+            if job.retries_left is None:
+                job.retries_left = self._default_retries
+            if job.backoff_sec is None:
+                job.backoff_sec = self._default_backoff
+            self._in_flight.add(job.invoice_id)
+            self.q.put(job)
+
+    def _handle_job(self, job: ActivationJob):
+        ok = False
+        try:
+            ok = _SELF_MODULE.auto_activate_on_usdt_receive(job.address)
+        except Exception as e:
+            logger.warning("Background activation error for %s (invoice %s): %s", job.address, job.invoice_id, e)
+            ok = False
+
+        # Update invoice status based on result
+        try:
+            db = next(get_db())
+            inv = get_invoice(db, job.invoice_id)
+            if ok:
+                # Return to pending unless already partial/paid
+                if inv and inv.status == 'activating':
+                    update_invoice(db, inv.id, status='pending')
+                    logger.info("Activation completed in background for %s (invoice %s)", job.address, job.invoice_id)
+            else:
+                # Retry logic with simple backoff
+                if job.retries_left > 0 and not self.sync_mode:
+                    job.retries_left -= 1
+                    logger.info("Requeue activation for %s (invoice %s), retries left %s", job.address, job.invoice_id, job.retries_left)
+                    time.sleep(job.backoff_sec)
+                    self.q.put(job)
+                    return
+                else:
+                    # Give up: move invoice out of 'activating' to allow future attempts
+                    if inv and inv.status == 'activating':
+                        update_invoice(db, inv.id, status='pending')
+                    logger.warning("Activation permanently failed for %s (invoice %s)", job.address, job.invoice_id)
+        except Exception as ue:
+            logger.error("Failed to update invoice after activation attempt %s: %s", job.invoice_id, ue)
+
+    def _worker(self):
+        while True:
+            try:
+                job: ActivationJob = self.q.get(timeout=1.0)  # type: ignore[assignment]
+            except Empty:
+                continue
+            try:
+                self._handle_job(job)
+            finally:
+                self._in_flight.discard(job.invoice_id)
+                self.q.task_done()
+
+    def wait_idle(self, timeout: float = 3.0):
+        """Block briefly until the queue has processed current jobs or timeout."""
+        end = time.time() + max(0.1, timeout)
+        while time.time() < end:
+            if self.q.empty() and not self._in_flight:
+                return
+            time.sleep(0.05)
+
 class KeeperBot:
     """Blockchain monitoring bot for invoice payments and TRX deposit forwarding"""
     
@@ -40,6 +144,15 @@ class KeeperBot:
         self.tron_config = config.tron
         self.client = self._get_tron_client()
         self.usdt_contract_address = self.tron_config.usdt_contract
+        # Background queue for activation jobs
+        aq_workers = max(1, int(config.keeper.activation_queue_workers))
+        self.activation_queue = ActivationJobQueue(
+            worker_count=aq_workers,
+            default_retries=int(config.keeper.activation_queue_retries),
+            backoff_sec=float(config.keeper.activation_queue_backoff_sec),
+        )
+        # Allow forcing synchronous processing in tests via env
+        self.activation_queue.sync_mode = bool(config.keeper.activation_queue_sync)
         logger.info("Keeper bot initialized for %s network", self.tron_config.network)
         logger.info("USDT contract: %s", self.usdt_contract_address)
     
@@ -125,21 +238,12 @@ class KeeperBot:
         # TODO: реализовать отправку уведомления (например, через Redis или очередь)
     
     def handle_invoice_payment(self, db, contract, inv, address: str, not_activated: bool):
-        """Handle payment for an invoice using balance-delta approach.
-        - Computes current USDT balance for the invoice address
-        - Records a synthetic transaction for any positive delta since last recorded total
+        """Handle payment for an invoice using a simple balance snapshot.
+        - Reads current USDT balance for the invoice address
+        - Records a single transaction reflecting the observed balance
         - Updates invoice status to 'partial' or 'paid'
-        - Triggers auto-activation when needed
+        Note: Activation, if needed, is handled by process_invoice before calling this.
         """
-        # Prevent repeated activation attempts by marking the invoice as 'activating'
-        if not_activated and inv.status not in ('activating', 'paid'):
-            update_invoice(db, inv.id, status='activating')
-            try:
-                auto_activate_on_usdt_receive(address)
-            except Exception as e:
-                logger.error("Activation failed for %s: %s", address, e)
-                # continue to record payments
-
         # Current on-chain USDT balance
         try:
             raw_balance = contract.functions.balanceOf(address)
@@ -148,64 +252,50 @@ class KeeperBot:
             logger.error("Failed to read USDT balance for %s: %s", address, e)
             return
 
-        # Previously recorded total
+        # Determine tx hash from recent transfer events (best effort)
+        last_tx_hash = self._try_get_last_txid(contract, address)
+
+        # Record a single transaction for the observed balance
         try:
-            tx_list = get_transactions_by_invoice(db, inv.id)
-            already_recorded = sum(float(t.amount_received or 0) for t in tx_list)
+            tx_hash_to_use = last_tx_hash or f"synthetic:{address}:{int(time.time())}:{int(current_received * 1_000_000)}"
+            create_transaction(
+                db,
+                invoice_id=inv.id,
+                tx_hash=tx_hash_to_use,
+                sender_address='multiple',
+                amount_received=current_received,
+                received_at=datetime.now(timezone.utc),
+            )
         except Exception as e:
-            logger.error("Failed to aggregate prior transactions for invoice %s: %s", inv.id, e)
-            already_recorded = 0.0
+            logger.debug("Failed to record transaction for invoice %s (may already exist): %s", inv.id, e)
 
-        delta = current_received - already_recorded
-        if delta > 0:
-            # Create an idempotent synthetic tx id based on latest block and observed balance
-            try:
-                latest = self.client.get_latest_block()
-                block_num = (
-                    latest.get('block_header', {}).get('raw_data', {}).get('number')
-                    if isinstance(latest, dict) else None
-                )
-            except Exception:
-                block_num = None
-            suffix = block_num if block_num is not None else int(time.time())
-            synthetic_txid = f"synthetic:{address}:{suffix}:{int(current_received * 1_000_000)}"
-            try:
-                create_transaction(
-                    db,
-                    invoice_id=inv.id,
-                    tx_hash=synthetic_txid,
-                    sender_address='multiple',
-                    amount_received=delta,
-                    received_at=datetime.now(timezone.utc),
-                )
-                logger.info("Recorded synthetic USDT receipt for invoice %s: +%.6f USDT (total %.6f)", inv.id, delta, current_received)
-            except Exception as e:
-                # If unique constraint prevents insert, it's likely already recorded for this observed state
-                logger.debug("Skipping duplicate synthetic tx for invoice %s: %s", inv.id, e)
-
-        # Recompute total after potential insert
+        # Update invoice status and notify
         try:
-            tx_list = get_transactions_by_invoice(db, inv.id)
-            total_received = sum(float(t.amount_received or 0) for t in tx_list)
-        except Exception:
-            total_received = already_recorded + max(0.0, delta)
-
-        # Update invoice status
-        try:
-            if total_received >= float(inv.amount):
-                if inv.status != 'paid':
-                    update_invoice(db, inv.id, status='paid')
-                    # best-effort tx hash notification
-                    last_tx_hash = tx_list[-1].tx_hash if tx_list else ''
-                    self.notify_invoice_paid(inv.id, tx_hash=last_tx_hash, amount=total_received)
-                    logger.info("Invoice %s fully paid: received %.6f / required %.6f", inv.id, total_received, float(inv.amount))
-            elif total_received > 0:
-                # Allow transition to partial from pending or activating
+            if current_received >= float(inv.amount):
+                update_invoice(db, inv.id, status='paid')
+                _SELF_MODULE.notify_invoice_paid(inv.id, last_tx_hash, current_received)
+                logger.info("Invoice %s fully paid: received %.6f / required %.6f", inv.id, current_received, float(inv.amount))
+            elif current_received > 0:
                 if inv.status not in ('partial', 'paid'):
                     update_invoice(db, inv.id, status='partial')
-                    logger.info("Invoice %s partially paid: received %.6f / required %.6f (prev status %s)", inv.id, total_received, float(inv.amount), inv.status)
+                    logger.info("Invoice %s partially paid: received %.6f / required %.6f (prev status %s)", inv.id, current_received, float(inv.amount), inv.status)
         except Exception as e:
             logger.error("Failed to update status for invoice %s: %s", inv.id, e)
+
+    def _try_get_last_txid(self, contract, to_address: str) -> str:
+        """Best-effort derive latest transfer txid to 'to_address' from contract events."""
+        try:
+            events = contract.functions.transferEvent()
+            if not isinstance(events, list):
+                return ""
+            picked = ""
+            for ev in events:
+                to_a = ev.get('to') or ev.get('to_address') or ev.get('toAddress')
+                if to_a == to_address:
+                    picked = ev.get('transaction_id') or ev.get('txID') or ev.get('txid') or picked
+            return picked
+        except Exception:
+            return ""
     
     def process_invoice(self, db, contract, invoice):
         """Process a single invoice for payments"""
@@ -248,26 +338,22 @@ class KeeperBot:
         # Proactive activation & resource delegation BEFORE any USDT arrives
         # so incoming TRC20 transfer will succeed without sender providing TRX.
         if not_activated and balance == 0 and invoice.status not in ('activating', 'paid', 'swept'):
-            try:
-                logger.info("Proactive activation attempt for address %s (invoice %s)", address, invoice.id)
-                update_invoice(db, invoice.id, status='activating')
-                ok = auto_activate_on_usdt_receive(address)
-                if ok:
-                    logger.info("Proactive activation successful for %s (invoice %s)", address, invoice.id)
-                    # Return to pending until payment detected; keep 'partial' if it was partial
-                    refreshed = get_invoice(db, invoice.id)
-                    if refreshed.status == 'activating':
-                        update_invoice(db, invoice.id, status='pending')
-                else:
-                    logger.warning("Proactive activation failed for %s (invoice %s)", address, invoice.id)
-            except Exception as e:
-                logger.error("Error during proactive activation for %s (invoice %s): %s", address, invoice.id, e)
+            # Switch to background activation
+            logger.info("Queueing proactive activation for address %s (invoice %s)", address, invoice.id)
+            update_invoice(db, invoice.id, status='activating')
+            self.activation_queue.enqueue(ActivationJob(invoice_id=invoice.id, address=address))
 
         if balance > 0:
             logger.info("Invoice %s has received %s USDT at address %s", 
                        invoice.id, balance, address)
-            inv = get_invoice(db, invoice.id)
-            self.handle_invoice_payment(db, contract, inv, address, not_activated)
+            # If not activated yet, trigger activation synchronously but don't alter invoice status here
+            if not_activated:
+                try:
+                    _SELF_MODULE.auto_activate_on_usdt_receive(address)
+                except Exception as e:
+                    logger.error("Activation (on first USDT) failed for %s: %s", address, e)
+            # Use the invoice object passed from the query to keep stable IDs for mocks/tests
+            self.handle_invoice_payment(db, contract, invoice, address, not_activated)
         elif invoice.status == 'partial':
             # No on-chain balance reported now, keep status until events are processed
             logger.debug("Invoice %s previously partial, waiting for more funds", invoice.id)
@@ -279,29 +365,29 @@ class KeeperBot:
         try:
             contract = self.client.get_contract(self.usdt_contract_address)
             
-            with next(get_db()) as db:
-                # Include invoices in pending, activating, or partial states
-                target_statuses = ('pending', 'activating', 'partial')
-                sellers = (
-                    db.query(Invoice.seller_id)
-                    .filter(Invoice.status.in_(target_statuses))
-                    .distinct()
-                )
-                
-                for seller_row in sellers:
-                    seller_id = seller_row.seller_id
-                    candidate_invoices = [
-                        inv for inv in get_invoices_by_seller(db, seller_id)
-                        if inv.status in target_statuses
-                    ]
-                    if candidate_invoices:
-                        logger.info(
-                            "Processing %s invoices (statuses in %s) for seller %s",
-                            len(candidate_invoices), target_statuses, seller_id
-                        )
-                        for invoice in candidate_invoices:
-                            self.process_invoice(db, contract, invoice)
-                            time.sleep(0.1)  # Small delay to avoid rate limiting
+            db = next(get_db())
+            # Include invoices in pending, activating, or partial states
+            target_statuses = ('pending', 'activating', 'partial')
+            sellers = (
+                db.query(Invoice.seller_id)
+                .filter(Invoice.status.in_(target_statuses))
+                .distinct()
+            )
+            
+            for seller_row in sellers:
+                seller_id = seller_row.seller_id
+                candidate_invoices = [
+                    inv for inv in get_invoices_by_seller(db, seller_id)
+                    if inv.status in target_statuses
+                ]
+                if candidate_invoices:
+                    logger.info(
+                        "Processing %s invoices (statuses in %s) for seller %s",
+                        len(candidate_invoices), target_statuses, seller_id
+                    )
+                    for invoice in candidate_invoices:
+                        self.process_invoice(db, contract, invoice)
+                        time.sleep(0.1)  # Small delay to avoid rate limiting
                 
         except Exception as e:
             logger.error("Error in check_pending_invoices: %s", e)
@@ -447,6 +533,20 @@ class KeeperBot:
 def notify_invoice_paid(invoice_id: int, tx_hash: str, amount: float):
     """Legacy function for backward compatibility"""
     logger.info("Invoice %s paid: tx=%s, amount=%s", invoice_id, tx_hash, amount)
+
+# Top-level shim for tests/backward compatibility
+def check_pending_invoices():
+    """Run a single invoice-check pass using a fresh KeeperBot instance.
+    Also waits briefly for any background activation jobs to finish (test-friendly).
+    """
+    keeper = KeeperBot()
+    # Respect config.keeper.activation_queue_sync; do not override here.
+    keeper.check_pending_invoices()
+    # Wait a bit for background activation queue to run (helps unit tests)
+    try:
+        keeper.activation_queue.wait_idle(timeout=1.5)
+    except Exception:
+        pass
 
 def main():
     """Main entry point"""

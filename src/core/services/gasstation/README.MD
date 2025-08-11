@@ -5,6 +5,7 @@ The Gas Station module provides comprehensive TRON resource management for Porto
 ## Overview
 
 The gas station manages:
+
 - **Energy** for USDT smart contract operations
 - **Bandwidth** for transaction execution  
 - **TRX** for account activation
@@ -13,7 +14,7 @@ The gas station manages:
 
 ## Architecture
 
-```
+```text
 src/core/services/gasstation/
 ├── __init__.py                 # Module exports
 ├── gas_station_service.py      # Core TRON operations
@@ -25,21 +26,27 @@ src/core/services/gasstation/
 ## Key Components
 
 ### GasStationService
+
 Core service handling direct TRON blockchain operations:
+
 - Resource management and monitoring
 - Account activation
 - Resource delegation
 - Auto-rebalancing
 
 ### GasStationManager  
+
 High-level business logic for PortoAPI integration:
+
 - Operational status checks
 - User and seller onboarding
 - Invoice processing validation
 - Maintenance operations
 
 ### Utilities
+
 Helper functions for calculations and analysis:
+
 - Transaction cost estimation
 - Staking efficiency analysis
 - Resource requirement planning
@@ -118,20 +125,25 @@ The gas station operates on TRON's Staking 2.0 model:
 3. **Resource Pools**: Pre-staked TRX generates daily renewable resources
 4. **Efficient Operation**: Direct resource delegation instead of TRX transfers
 
-### Typical USDT Transaction Costs
-- **Energy**: 31,895 units per USDT transfer
-- **Bandwidth**: 345 units per transaction
-- **Account Activation**: 1.0 TRX (configurable)
+### Typical USDT Transaction Costs (defaults)
+
+- Energy: ~14,650 units per USDT transfer (Nile testnet baseline)
+- Bandwidth: ~345 units per transaction
+- Account Activation: 1.0 TRX (configurable)
+
+Note: The module computes BANDWIDTH units/TRX dynamically from chain parameters when available and falls back to config estimates otherwise.
 
 ## Monitoring and Maintenance
 
-The gas station provides comprehensive monitoring:
+The gas station provides comprehensive monitoring and resilient operations:
 
 - **Real-time resource status**
 - **Daily transaction capacity calculation**
 - **Staking efficiency analysis**
 - **Automatic rebalancing recommendations**
 - **Operational health checks**
+- **Resilient confirmations** using multiple endpoints (wallet and walletsolidity, local and remote)
+- **Lag-aware resource reads**: queries multiple views and uses the maximum observed values
 
 ## Enterprise Features
 
@@ -140,6 +152,7 @@ The gas station provides comprehensive monitoring:
 - **Fee collection framework** for revenue management
 - **High-availability** with operational status monitoring
 - **Resource optimization** for cost-effective operations
+- **Free Gas integration**: one-click address activation and minimum resource top-up via Telegram bot (/free_gas)
 
 ## Security
 

@@ -1,14 +1,27 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from src.core.database.models import (
+try:
+    from core.database.models import (
+        Seller,
+        Invoice,
+        Transaction,
+        Wallet,
+        GasStation,
+        BuyerGroup,
+        FreeGasUsage,
+        Base,
+    )
+except ImportError:
+    from src.core.database.models import (
     Seller,
     Invoice,
     Transaction,
     Wallet,
     GasStation,
     BuyerGroup,
+    FreeGasUsage,
     Base,
-)
+    )
 import os
 import logging
 from typing import Optional
@@ -185,7 +198,13 @@ def delete_transaction(db, tx_id):
 
 # --- WALLETS CRUD ---
 def create_wallet(db, **kwargs):
-    wallet = Wallet(**kwargs)
+    # Backward-compat: map telegram_id->seller_id and invoices_group->account if provided
+    mapped = dict(kwargs)
+    if "seller_id" not in mapped and "telegram_id" in mapped:
+        mapped["seller_id"] = mapped.pop("telegram_id")
+    if "account" not in mapped and "invoices_group" in mapped:
+        mapped["account"] = mapped.pop("invoices_group")
+    wallet = Wallet(**mapped)
     db.add(wallet)
     db.commit()
     db.refresh(wallet)
@@ -278,3 +297,20 @@ def delete_gas_station(db, gs_id):
     gs = get_gas_station(db, gs_id)
     db.delete(gs)
     db.commit()
+
+
+# --- FREE GAS USAGE CRUD ---
+def get_free_gas_usage(db, seller_id):
+    return db.query(FreeGasUsage).filter(FreeGasUsage.seller_id == seller_id).first()
+
+
+def increment_free_gas_usage(db, seller_id) -> int:
+    rec = get_free_gas_usage(db, seller_id)
+    if not rec:
+        rec = FreeGasUsage(seller_id=seller_id, used_count=1)
+        db.add(rec)
+    else:
+        rec.used_count = int(rec.used_count or 0) + 1
+    db.commit()
+    db.refresh(rec)
+    return rec.used_count

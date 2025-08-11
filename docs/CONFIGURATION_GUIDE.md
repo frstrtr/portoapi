@@ -5,6 +5,7 @@ This guide explains how to configure PortoAPI using the `.env` file.
 ## Quick Setup
 
 1. **Copy the template**:
+
    ```bash
    cp .env.example .env
    ```
@@ -12,6 +13,7 @@ This guide explains how to configure PortoAPI using the `.env` file.
 2. **Configure your values** using this guide
 
 3. **Validate configuration**:
+
    ```bash
    python scripts/validate_config.py
    ```
@@ -75,6 +77,7 @@ DATABASE_ECHO=false
 ### ⚡ TRON Network Configuration
 
 #### Network Selection
+
 ```env
 TRON_NETWORK=testnet
 TRON_API_KEY=your_trongrid_api_key_here
@@ -85,6 +88,7 @@ TRON_API_KEY=your_trongrid_api_key_here
   - Get from: [TronGrid Console](https://www.trongrid.io/)
 
 #### Local TRON Nodes (Recommended)
+
 ```env
 TRON_LOCAL_NODE_ENABLED=true
 
@@ -102,18 +106,25 @@ TRON_TESTNET_LOCAL_GRPC_ENDPOINT=your_testnet_ip:50051
 ```
 
 **Replace placeholders:**
+
 - `your_mainnet_ip`: IP address of your mainnet TRON node
 - `your_testnet_ip`: IP address of your testnet TRON node
 
 **If you don't have local nodes:**
+
 - Set `TRON_LOCAL_NODE_ENABLED=false`
 - The system will use remote APIs automatically
+
+#### Dynamic BANDWIDTH Yield
+
+The service attempts to read chain parameters (totalNetLimit/totalNetWeight) from your node to compute the current BANDWIDTH units per 1 TRX automatically. If these parameters are unavailable, it falls back to the environment estimate `BANDWIDTH_UNITS_PER_TRX_ESTIMATE`.
 
 ### 🔐 Gas Station Configuration
 
 The Gas Station manages TRX for activating new addresses and delegating resources.
 
 #### Single Wallet Mode (Recommended)
+
 ```env
 GAS_STATION_TYPE=single
 GAS_WALLET_PRIVATE_KEY=your_private_key_64_characters_hex
@@ -123,6 +134,7 @@ GAS_WALLET_MNEMONIC=your twelve word mnemonic phrase for gas station wallet
 **How to get these values:**
 
 1. **For Testnet Development**:
+
    ```bash
    # Generate test wallet
    python scripts/generate_test_wallet.py
@@ -137,6 +149,7 @@ GAS_WALLET_MNEMONIC=your twelve word mnemonic phrase for gas station wallet
    - Mnemonic: 12 or 24 word BIP39 phrase
 
 #### Resource Amounts
+
 ```env
 AUTO_ACTIVATION_TRX_AMOUNT=1.0
 ENERGY_DELEGATION_TRX_AMOUNT=1.0
@@ -144,10 +157,28 @@ BANDWIDTH_DELEGATION_TRX_AMOUNT=0.5
 ```
 
 **Recommended values:**
+
 - **Testnet**: 1.0, 1.0, 0.5 TRX (lower costs)
 - **Mainnet**: 1.5, 2.0, 1.0 TRX (production amounts)
 
+#### Targets and Estimates
+
+Set targets so a single USDT TRC20 transfer succeeds reliably:
+
+```env
+TARGET_ENERGY_UNITS=90000
+TARGET_BANDWIDTH_UNITS=1000
+ENERGY_UNITS_PER_TRX_ESTIMATE=300
+BANDWIDTH_UNITS_PER_TRX_ESTIMATE=1500
+USDT_ENERGY_PER_TRANSFER_ESTIMATE=14650
+USDT_BANDWIDTH_PER_TRANSFER_ESTIMATE=345
+DELEGATION_SAFETY_MULTIPLIER=1.1
+MIN_DELEGATE_TRX=1.0
+GAS_ACCOUNT_ACTIVATION_MODE=transfer
+```
+
 #### Multisig Mode (Advanced)
+
 ```env
 GAS_STATION_TYPE=multisig
 MULTISIG_CONTRACT_ADDRESS=TYourMultiSigContractAddress123456789
@@ -164,6 +195,7 @@ ADMIN_IDS=123456789,987654321
 ```
 
 **How to get Telegram User IDs:**
+
 1. Message [@userinfobot](https://t.me/userinfobot) on Telegram
 2. Copy your numeric user ID
 3. Add multiple IDs separated by commas
@@ -194,21 +226,35 @@ Set both to `true` for development mode with verbose logging.
 ## Example Configurations
 
 ### Development Setup (Testnet)
+
 ```env
 TRON_NETWORK=testnet
 TRON_LOCAL_NODE_ENABLED=true
 GAS_STATION_TYPE=single
 DEBUG=true
 LOG_LEVEL=DEBUG
+TARGET_ENERGY_UNITS=90000
+TARGET_BANDWIDTH_UNITS=1000
+ENERGY_UNITS_PER_TRX_ESTIMATE=300
+BANDWIDTH_UNITS_PER_TRX_ESTIMATE=1500
+USDT_ENERGY_PER_TRANSFER_ESTIMATE=14650
+USDT_BANDWIDTH_PER_TRANSFER_ESTIMATE=345
 ```
 
 ### Production Setup (Mainnet)
+
 ```env
 TRON_NETWORK=mainnet
 TRON_LOCAL_NODE_ENABLED=true
 GAS_STATION_TYPE=single
 DEBUG=false
 LOG_LEVEL=INFO
+TARGET_ENERGY_UNITS=90000
+TARGET_BANDWIDTH_UNITS=1000
+ENERGY_UNITS_PER_TRX_ESTIMATE=300
+BANDWIDTH_UNITS_PER_TRX_ESTIMATE=1500
+USDT_ENERGY_PER_TRANSFER_ESTIMATE=14650
+USDT_BANDWIDTH_PER_TRANSFER_ESTIMATE=345
 ```
 
 ## Security Best Practices
@@ -220,6 +266,7 @@ LOG_LEVEL=INFO
 5. **Monitor gas station wallet** balance regularly
 6. **Keep local nodes** on private networks
 7. **Regularly backup** your database
+8. **Enable local pre-commit hooks** to block secrets and large files: see `.hooks-README.md`
 
 ## Testing Your Configuration
 
@@ -233,6 +280,10 @@ python scripts/validate_config.py
 # Switch networks easily
 ./scripts/switch_network.sh testnet
 ./scripts/switch_network.sh mainnet
+
+# Optional: enable the local pre-commit hook
+chmod +x .git-hooks/pre-commit
+git config core.hooksPath .git-hooks
 ```
 
 ## Troubleshooting
@@ -244,6 +295,8 @@ python scripts/validate_config.py
 3. **"Bot token invalid"**: Verify token from @BotFather
 4. **"Database locked"**: Stop all PortoAPI processes
 5. **"Insufficient balance"**: Add TRX to gas station wallet
+6. **"Delegation/activation timed out"**: Nodes can be slow; the system continues after resource effects are visible. Severity is reduced to WARNING in logs.
+7. **"Energy shown as 0 right after delegation"**: Different endpoints may lag; the system reads from multiple views and uses the maximum observed. Recheck after a short delay.
 
 ### Getting Help
 

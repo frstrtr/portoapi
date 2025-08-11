@@ -1,0 +1,27 @@
+{
+  "name": "portoapi",
+  "version": "1.0.0",
+  "description": "Многофункциональная платформа для приема криптоплатежей через Telegram-бота и API с поддержкой TRON, xPub, учёта покупателей и инвойсов.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/frstrtr/portoapi.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/frstrtr/portoapi/issues"
+  },
+  "homepage": "https://github.com/frstrtr/portoapi#readme",
+  "devDependencies": {
+    "markdownlint-cli": "^0.39.0"
+  }
+}

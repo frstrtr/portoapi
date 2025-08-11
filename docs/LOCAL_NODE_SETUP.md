@@ -43,6 +43,7 @@ TRON_REMOTE_EVENT_SERVER=https://api.trongrid.io
 For development with dedicated nodes:
 
 **Nile Testnet Node** (Development):
+
 ```bash
 TRON_NETWORK=testnet
 TRON_LOCAL_NODE_ENABLED=true
@@ -58,6 +59,7 @@ TRON_REMOTE_TESTNET_SOLIDITY_NODE=https://nile.trongrid.io
 ```
 
 **Mainnet Node** (Production):
+
 ```bash
 TRON_NETWORK=mainnet
 TRON_LOCAL_NODE_ENABLED=true
@@ -75,6 +77,7 @@ TRON_REMOTE_MAINNET_SOLIDITY_NODE=https://api.trongrid.io
 #### Single-Node Setup (Alternative)
 
 For **Testnet** (Nile):
+
 ```bash
 TRON_NETWORK=testnet
 TRON_LOCAL_FULL_NODE=http://127.0.0.1:16667
@@ -84,6 +87,7 @@ TRON_REMOTE_SOLIDITY_NODE=https://nile.trongrid.io
 ```
 
 For **Mainnet**:
+
 ```bash
 TRON_NETWORK=mainnet
 TRON_LOCAL_FULL_NODE=http://127.0.0.1:8090
@@ -104,16 +108,19 @@ You have two TRON nodes running in your network:
 ### Quick Start for Your Setup
 
 1. **Test your nodes**:
+
    ```bash
    python scripts/test_network_nodes.py
    ```
 
 2. **Generate development wallet**:
+
    ```bash
    python scripts/generate_test_wallet.py
    ```
 
 3. **Configure for development**:
+
    ```bash
    # Copy generated config
    cp .env.development .env
@@ -127,6 +134,7 @@ You have two TRON nodes running in your network:
    - Send TRX to your generated wallet address
 
 5. **Start development**:
+
    ```bash
    python scripts/start.py validate
    python scripts/start.py bot
@@ -162,6 +170,7 @@ volumes:
 ```
 
 Start the node:
+
 ```bash
 docker-compose up -d tron-node
 ```
@@ -173,6 +182,7 @@ docker-compose up -d tron-node
    - Mainnet: `main_net_config.conf`
    - Testnet: `test_net_config.conf`
 3. Start the node:
+
    ```bash
    java -Xmx4g -jar FullNode.jar -c main_net_config.conf
    ```
@@ -180,7 +190,7 @@ docker-compose up -d tron-node
 ### Node Synchronization
 
 - **Initial Sync**: Can take several hours to days depending on network and hardware
-- **Storage Requirements**: 
+- **Storage Requirements**:
   - Mainnet: ~500GB+ (growing)
   - Testnet: ~50GB+ (growing)
 - **Hardware Requirements**: 4GB+ RAM, SSD recommended
@@ -210,6 +220,7 @@ python scripts/validate_config.py
 ```
 
 This will test:
+
 - Local node connectivity
 - Remote API fallback
 - Network configuration
@@ -263,6 +274,7 @@ grep "Connection.*health" logs/portoapi.log
 ### Gas Station Service
 
 The Gas Station automatically:
+
 - Tests local node connectivity on startup
 - Performs health checks every operation
 - Falls back to remote APIs on failure
@@ -277,6 +289,7 @@ The Gas Station automatically:
 ### Performance Metrics
 
 The system tracks:
+
 - Connection latency
 - Success/failure rates
 - Fallback frequency

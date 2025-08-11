@@ -3,8 +3,12 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from src.core.database.db_service import get_db
-from src.core.database.models import Seller
+try:
+    from core.database.db_service import get_db  # type: ignore
+    from core.database.models import Seller  # type: ignore
+except ImportError:  # pragma: no cover
+    from src.core.database.db_service import get_db  # type: ignore
+    from src.core.database.models import Seller  # type: ignore
 
 router = APIRouter()
 

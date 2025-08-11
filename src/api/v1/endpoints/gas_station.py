@@ -1,8 +1,12 @@
 # Эндпоинты для управления газовым депозитом
 from fastapi import APIRouter, HTTPException, status, Depends, Query
 from sqlalchemy.orm import Session
-from src.core.database.db_service import get_db
-from src.core.database.models import Seller
+try:
+    from core.database.db_service import get_db  # type: ignore
+    from core.database.models import Seller  # type: ignore
+except ImportError:  # pragma: no cover
+    from src.core.database.db_service import get_db  # type: ignore
+    from src.core.database.models import Seller  # type: ignore
 
 router = APIRouter()
 

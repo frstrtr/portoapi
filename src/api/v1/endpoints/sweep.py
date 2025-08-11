@@ -1,8 +1,13 @@
 from fastapi import APIRouter, HTTPException, status, Depends, Body
 from sqlalchemy.orm import Session
-from src.core.database.db_service import get_db
-from src.core.database.models import Seller, Invoice
-from src.core.services.gas_station import prepare_for_sweep
+try:
+    from core.database.db_service import get_db  # type: ignore
+    from core.database.models import Seller, Invoice  # type: ignore
+    from core.services.gas_station import prepare_for_sweep  # type: ignore
+except ImportError:  # pragma: no cover
+    from src.core.database.db_service import get_db  # type: ignore
+    from src.core.database.models import Seller, Invoice  # type: ignore
+    from src.core.services.gas_station import prepare_for_sweep  # type: ignore
 
 router = APIRouter()
 

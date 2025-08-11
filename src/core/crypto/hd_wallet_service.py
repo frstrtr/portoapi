@@ -6,7 +6,7 @@ from bip_utils import Bip44, Bip44Coins, Bip44Changes, Base58Decoder
 logger = logging.getLogger("hd_wallet_service")
 
 
-def generate_address_from_xpub(xpub, account=None, address_index=0):
+def generate_address_from_xpub(xpub, index=0, account=None):
     """
     Принимает xPub (str), индекс (int), и необязательный account (int).
     Если xPub на уровне account (depth=3), производит derivation только Change/AddressIndex.
@@ -16,8 +16,8 @@ def generate_address_from_xpub(xpub, account=None, address_index=0):
     logger.info(
         "generate_address_from_xpub called with xpub=%s, account=%s, address_index=%s",
         xpub,
-        account,
-        address_index,
+    account,
+    index,
     )
 
     pub_ctx = Bip44.FromExtendedKey(xpub, Bip44Coins.TRON)
@@ -40,13 +40,13 @@ def generate_address_from_xpub(xpub, account=None, address_index=0):
         # xpub is at account level, derive Change/AddressIndex only
         address = (
             pub_ctx.Change(Bip44Changes.CHAIN_EXT)
-            .AddressIndex(address_index)
+            .AddressIndex(index)
             .PublicKey()
             .ToAddress()
         )
         logger.info(
             "Derived address with path m/44'/195'/<account>'/0/%d: %s (account xpub)",
-            address_index,
+            index,
             address,
         )
     else:
@@ -56,14 +56,14 @@ def generate_address_from_xpub(xpub, account=None, address_index=0):
         account_ctx = pub_ctx.Purpose().Coin().Account(account)
         address = (
             account_ctx.Change(Bip44Changes.CHAIN_EXT)
-            .AddressIndex(address_index)
+            .AddressIndex(index)
             .PublicKey()
             .ToAddress()
         )
         logger.info(
             "Derived address with path m/44'/195'/%d'/0/%d: %s",
             account,
-            address_index,
+            index,
             address,
         )
     return address

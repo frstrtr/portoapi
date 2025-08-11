@@ -9,7 +9,6 @@ Safe permissions:
     Reclaim Resources
     Cancel Unstake
 
-
 Tronpool (Binance):
     Vote
     Claim Voting Rewards

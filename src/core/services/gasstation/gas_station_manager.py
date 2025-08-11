@@ -6,7 +6,10 @@ Provides high-level interface for gas station operations
 import logging
 from typing import Dict, Optional, Tuple
 from .gas_station_service import GasStationService
-from src.core.config import config
+try:
+    from core.config import config
+except ImportError:
+    from src.core.config import config
 
 logger = logging.getLogger(__name__)
 
@@ -190,3 +193,19 @@ class GasStationManager:
             maintenance_results['error'] = str(e)
         
         return maintenance_results
+    
+#    TRON MAINNET. Fees paid by transaction senders/sending addresses:
+
+# 1. Issue a TRC10 token: 1,024 TRX
+
+# 2. Apply to be an SR candidate: 9,999 TRX
+
+# 3. Create a Bancor transaction: 1,024 TRX
+
+# 4. Update the account permission: 100 TRX
+
+# 5. Activate the account: 1 TRX
+
+# 6. Multi-sig transaction: 1 TRX
+
+# 7. Transaction note: 1 TRX

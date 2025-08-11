@@ -4,9 +4,14 @@ from fastapi import APIRouter, HTTPException, status, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
-from src.core.database.db_service import get_db
-from src.core.database.models import Seller, Invoice
-from src.core.crypto.hd_wallet_service import generate_address_from_xpub
+try:
+    from core.database.db_service import get_db  # type: ignore
+    from core.database.models import Seller, Invoice  # type: ignore
+    from core.crypto.hd_wallet_service import generate_address_from_xpub  # type: ignore
+except ImportError:  # pragma: no cover
+    from src.core.database.db_service import get_db  # type: ignore
+    from src.core.database.models import Seller, Invoice  # type: ignore
+    from src.core.crypto.hd_wallet_service import generate_address_from_xpub  # type: ignore
 
 router = APIRouter()
 
@@ -59,12 +64,14 @@ def create_invoice(
 # --- GET /invoices ---
 @router.get("/invoices")
 def list_invoices(
-    telegram_id: int = Query(..., description="Seller telegram id"),
+    telegram_id: int | None = Query(None, description="Seller telegram id"),
     db: Session = Depends(get_db)
 ):
+    if telegram_id is None:
+        return {"invoices": []}
     seller = db.query(Seller).filter(Seller.telegram_id == telegram_id).first()
     if not seller:
-        raise HTTPException(status_code=404, detail="Seller not found.")
+        return {"invoices": []}
     invoices = (
         db.query(Invoice)
         .filter(Invoice.seller_id == seller.id)

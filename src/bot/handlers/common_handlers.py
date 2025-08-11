@@ -2,22 +2,26 @@
 
 
 from aiogram import types
-from src.core.database.db_service import get_seller, SessionLocal
+try:
+    from core.database.db_service import get_seller, SessionLocal
+except ImportError:
+    from src.core.database.db_service import get_seller, SessionLocal
 
 
 def get_main_menu_keyboard(is_registered: bool = True):
     """Generate main menu keyboard based on registration status"""
     if is_registered:
         keyboard = [
+            [types.KeyboardButton(text="/help"), types.KeyboardButton(text="⛽️ Free Gas ⛽️")],
             [types.KeyboardButton(text="/myaccount"), types.KeyboardButton(text="/balance")],
             [types.KeyboardButton(text="/create_invoice"), types.KeyboardButton(text="/buyers")],
             [types.KeyboardButton(text="/invoices"), types.KeyboardButton(text="/sweep")],
-            [types.KeyboardButton(text="/add_buyer"), types.KeyboardButton(text="/deposit")],
-            [types.KeyboardButton(text="/help")]
+            [types.KeyboardButton(text="/add_buyer"), types.KeyboardButton(text="/deposit")]
         ]
     else:
         keyboard = [
-            [types.KeyboardButton(text="/register"), types.KeyboardButton(text="/help")]
+            [types.KeyboardButton(text="/register"), types.KeyboardButton(text="/help")],
+			[types.KeyboardButton(text="⛽️ Free Gas ⛽️")]
         ]
     
     return types.ReplyKeyboardMarkup(
@@ -35,7 +39,10 @@ async def handle_start(message: types.Message):
         db = SessionLocal()
         seller = get_seller(db=db, telegram_id=user.id)
         # Check if user has any xPub configured
-        from src.core.database.db_service import get_wallets_by_seller, get_buyer_groups_by_seller
+        try:
+            from core.database.db_service import get_wallets_by_seller, get_buyer_groups_by_seller
+        except ImportError:
+            from src.core.database.db_service import get_wallets_by_seller, get_buyer_groups_by_seller
         wallets = get_wallets_by_seller(db, user.id)
         buyer_groups = get_buyer_groups_by_seller(db, user.id)
         has_xpub = any(w.xpub for w in wallets) or any(g.xpub for g in buyer_groups)
@@ -76,7 +83,10 @@ async def handle_help(message: types.Message):
     try:
         db = SessionLocal()
         seller = get_seller(db=db, telegram_id=message.from_user.id)
-        from src.core.database.db_service import get_wallets_by_seller, get_buyer_groups_by_seller
+        try:
+            from core.database.db_service import get_wallets_by_seller, get_buyer_groups_by_seller
+        except ImportError:
+            from src.core.database.db_service import get_wallets_by_seller, get_buyer_groups_by_seller
         wallets = get_wallets_by_seller(db, message.from_user.id)
         buyer_groups = get_buyer_groups_by_seller(db, message.from_user.id)
         has_xpub = any(w.xpub for w in wallets) or any(g.xpub for g in buyer_groups)
@@ -106,6 +116,7 @@ async def handle_help(message: types.Message):
 • /gasstation - статус и управление газовой станцией
 • /gasstation_stake - управление стейкингом
 • /gasstation_delegate - управление делегированием
+• /free_gas - подготовка адреса (активация + ресурсы)
 
 🤖 **Мониторинг:**
 • /keeper_status - статус keeper bot
@@ -129,6 +140,9 @@ async def handle_help(message: types.Message):
 2. Настройка xPub кошелька (офлайн)
 3. Создание покупателей и инвойсов
 
+⛽ **Free Gas:**
+Нажмите кнопку "⛽️ Free Gas ⛽️" и отправьте адрес TRON (T...), чтобы активировать адрес и получить ресурсы для одной транзакции USDT.
+
 ❓ **Что такое xPub?**
 Это публичный ключ, который позволяет генерировать адреса для приема платежей без доступа к приватным ключам.
 
@@ -136,4 +150,4 @@ async def handle_help(message: types.Message):
 Все операции с приватными ключами выполняются только на вашем устройстве."""
     
     keyboard = get_main_menu_keyboard(is_registered=is_registered)
-    await message.answer(help_text, parse_mode="Markdown", reply_markup=keyboard)
+    await message.answer(help_text, parse_mode="HTML", reply_markup=keyboard)

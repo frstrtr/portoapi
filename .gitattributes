@@ -1,0 +1,5 @@
+# Normalize line endings
+* text=auto
+
+# Treat secrets as text for diff, but they should be ignored by .gitignore
+*.env text eol=lf

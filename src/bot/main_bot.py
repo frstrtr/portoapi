@@ -53,6 +53,12 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 bot.db = SessionLocal()
 
+# Reduce noisy repeated network error logs from aiogram dispatcher during transient timeouts
+try:
+    logging.getLogger("aiogram.dispatcher").setLevel(logging.WARNING)
+except Exception:
+    pass
+
 
 def log_user_action(user: types.User, action: str, extra: str = ""):
     logger.info("User %s (%s): action=%s %s", user.id, user.username, action, extra)
@@ -151,6 +157,15 @@ async def main():
     dp.message.register(
         log_and_handle(seller_handlers.handle_gasstation_withdraw, "/gasstation_withdraw"),
         lambda m: m.text == "/gasstation_withdraw",
+    )
+    # Free Gas: one-time activation + delegation
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_free_gas, "/free_gas"),
+        lambda m: m.text == "/free_gas",
+    )
+    dp.message.register(
+    log_and_handle(seller_handlers.handle_free_gas, "FreeGas"),
+    lambda m: m.text in {"FreeGas", "Free Gas", "⛽️ Free Gas ⛽️", "/freegas", "/freeGas"},
     )
     
     logger.info("Starting Telegram bot...")
@@ -271,6 +286,15 @@ async def main():
     dp.message.register(
         log_and_handle(seller_handlers.process_withdraw_signed, "withdraw_signed"),
         seller_handlers.WithdrawFSM.await_signed,
+    )
+    # Free Gas FSM
+    dp.message.register(
+        log_and_handle(seller_handlers.process_free_gas_address, "free_gas_address"),
+        seller_handlers.FreeGasFSM.ask_address,
+    )
+    dp.message.register(
+        log_and_handle(seller_handlers.process_free_gas_confirm, "free_gas_confirm"),
+        seller_handlers.FreeGasFSM.confirm_topup,
     )
 
     max_retries = 10

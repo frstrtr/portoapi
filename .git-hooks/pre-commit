@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Pre-commit hook to prevent accidental secret commits and large binary files
+set -euo pipefail
+
+RED="\033[0;31m"; GREEN="\033[0;32m"; YELLOW="\033[0;33m"; NC="\033[0m"
+
+# Ensure we are running in a git repo
+git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+
+# Files staged for commit (Added/Copied/Modified/Renamed), NUL-delimited to handle spaces
+STAGED_LIST=$(git diff --cached --name-only --diff-filter=ACMR -z)
+[ -z "${STAGED_LIST}" ] && exit 0
+
+# Block committing .env, private keys, or known secret-bearing filenames
+BLOCK_PATTERNS='(^|/)\.env(\..*)?$|(^|/)\.pypirc$|(^|/)id_rsa(\.pub)?$|(^|/)id_ed25519(\.pub)?$|api[_-]?key|secret[_-]?key|private[_-]?key'
+
+# Max file size in bytes (e.g., 5MB)
+MAX_SIZE=$((5*1024*1024))
+
+fail=false
+
+# Iterate staged files safely (no subshell so `fail` persists)
+while IFS= read -r -d '' file; do
+  # Block patterns
+  if printf '%s' "$file" | grep -Ei "$BLOCK_PATTERNS" >/dev/null 2>&1; then
+    echo -e "${RED}[pre-commit] Blocked committing sensitive file: $file${NC}"
+    fail=true
+    continue
+  fi
+
+  # Size check
+  if [ -f "$file" ]; then
+    size=$(wc -c < "$file")
+    if [ "$size" -gt "$MAX_SIZE" ]; then
+      echo -e "${RED}[pre-commit] File too large (>5MB): $file (${size} bytes)${NC}"
+      fail=true
+    fi
+  fi
+
+  # Secret scan in staged diff (simple patterns, case-insensitive)
+  if git diff --cached -U0 -- "$file" | grep -Ei "(AWS_|AWS|GAS_WALLET_PRIVATE_KEY|TELEGRAM_BOT_TOKEN|TRON_API_KEY|MNEMONIC|WALLET_MNEMONIC|PRIVATE[_-]?KEY|SECRET[_-]?KEY|SECRET|PASSWORD|TOKEN)" >/dev/null 2>&1; then
+    echo -e "${RED}[pre-commit] Potential secret detected in: $file${NC}"
+    fail=true
+  fi
+done < <(printf '%s' "$STAGED_LIST")
+
+if $fail; then
+  echo -e "${YELLOW}Tip:${NC} Use .env and .env.example; never commit secrets."
+  echo -e "${YELLOW}To bypass (not recommended), run: git commit --no-verify${NC}"
+  exit 1
+fi
+
+exit 0

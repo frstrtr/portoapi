@@ -96,6 +96,14 @@ class GasStation(Base):
     seller = relationship("Seller", back_populates="gas_station", uselist=False)
 
 
+class FreeGasUsage(Base):
+    __tablename__ = "free_gas_usage"
+    seller_id = Column(Integer, ForeignKey("sellers.telegram_id"), primary_key=True)
+    used_count = Column(Integer, default=0)
+    updated_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
+    seller = relationship("Seller")
+
+
 class Wallet(Base):
     __tablename__ = "wallets"
     id = Column(Integer, primary_key=True)

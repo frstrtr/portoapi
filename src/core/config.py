@@ -17,10 +17,10 @@ class TronConfig:
         # Network Configuration
         self.network = os.getenv("TRON_NETWORK", "testnet")  # mainnet or testnet
         self.api_key = os.getenv("TRON_API_KEY", "")
-        
+
         # Local node configuration (preferred if available)
         self.local_node_enabled = os.getenv("TRON_LOCAL_NODE_ENABLED", "true").lower() == "true"
-        
+
         # Network-specific local nodes
         if self.network == "mainnet":
             self.local_full_node = os.getenv("TRON_MAINNET_LOCAL_FULL_NODE", "http://192.168.86.20:8090")
@@ -32,7 +32,7 @@ class TronConfig:
             self.local_solidity_node = os.getenv("TRON_TESTNET_LOCAL_SOLIDITY_NODE", "http://192.168.86.154:8091")
             self.local_event_server = os.getenv("TRON_TESTNET_LOCAL_EVENT_SERVER", "http://192.168.86.154:8092")
             self.local_grpc_endpoint = os.getenv("TRON_TESTNET_LOCAL_GRPC_ENDPOINT", "192.168.86.154:50051")
-        
+
         # Remote endpoints (fallback)
         if self.network == "mainnet":
             self.remote_full_node = os.getenv("TRON_REMOTE_MAINNET_FULL_NODE", "https://api.trongrid.io")
@@ -44,19 +44,19 @@ class TronConfig:
             self.remote_solidity_node = os.getenv("TRON_REMOTE_TESTNET_SOLIDITY_NODE", "https://nile.trongrid.io")
             self.remote_event_server = os.getenv("TRON_REMOTE_TESTNET_EVENT_SERVER", "https://nile.trongrid.io")
             self.usdt_contract = os.getenv("TRON_TESTNET_USDT_CONTRACT", "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf")
-        
+
         # Gas Station Configuration
         self.gas_station_type = os.getenv("GAS_STATION_TYPE", "single")  # single or multisig
-        
+
         # Single wallet gas station
         self.gas_wallet_private_key = os.getenv("GAS_WALLET_PRIVATE_KEY", "")
         self.gas_wallet_mnemonic = os.getenv("GAS_WALLET_MNEMONIC", "")
-        
+
         # Multisig gas station
         self.multisig_contract_address = os.getenv("MULTISIG_CONTRACT_ADDRESS", "")
         self.multisig_required_signatures = int(os.getenv("MULTISIG_REQUIRED_SIGNATURES", "2"))
         self.multisig_owner_keys = self._parse_multisig_keys()
-        
+
         # Resource delegation settings (network-specific)
         if self.network == "testnet":
             # Testnet defaults tuned to reach TRC20 transfer energy in a few steps
@@ -70,32 +70,40 @@ class TronConfig:
             # Bump energy delegation step for faster convergence
             self.energy_delegation_amount = float(os.getenv("ENERGY_DELEGATION_TRX_AMOUNT", "20.0"))
             self.bandwidth_delegation_amount = float(os.getenv("BANDWIDTH_DELEGATION_TRX_AMOUNT", "2.0"))
-        
+
         # Target resource thresholds to enable USDT transfer reliably
         # Energy target bumped to cover up to ~4 TRC20 transfers per address with headroom
         self.target_energy_units = int(os.getenv("TARGET_ENERGY_UNITS", "90000"))
         # Bandwidth target; fresh activation grants ~600 free bandwidth, add headroom
         self.target_bandwidth_units = int(os.getenv("TARGET_BANDWIDTH_UNITS", "1000"))
-        
+
         # Heuristic conversion estimates (units per 1 TRX staked); tune per network
+        # Default: 300 energy units per 1 TRX (adjust via env if needed)
         self.energy_units_per_trx_estimate = int(os.getenv("ENERGY_UNITS_PER_TRX_ESTIMATE", "300"))
         self.bandwidth_units_per_trx_estimate = int(os.getenv("BANDWIDTH_UNITS_PER_TRX_ESTIMATE", "1500"))
-        
+
         # Per-transfer resource estimates for TRC20 USDT transfer (used to top-up only as needed)
-        # Tune via env if your network requires different amounts
-        self.usdt_energy_per_transfer_estimate = int(os.getenv("USDT_ENERGY_PER_TRANSFER_ESTIMATE", "25000"))
-        self.usdt_bandwidth_per_transfer_estimate = int(os.getenv("USDT_BANDWIDTH_PER_TRANSFER_ESTIMATE", "400"))
-        
+        # Defaults tuned for Nile testnet as observed via Tronscan API: ~14,650 energy and ~345 bandwidth
+        # Override via env if your network requires different amounts or for mainnet tuning
+        self.usdt_energy_per_transfer_estimate = int(os.getenv("USDT_ENERGY_PER_TRANSFER_ESTIMATE", "14650"))
+        self.usdt_bandwidth_per_transfer_estimate = int(os.getenv("USDT_BANDWIDTH_PER_TRANSFER_ESTIMATE", "345"))
+
         # Safety caps per invoice so we don't drain gas wallet on a single address (bumped for higher targets)
         self.max_energy_delegation_trx_per_invoice = float(os.getenv("MAX_ENERGY_DELEGATION_TRX_PER_INVOICE", "300.0"))
         self.max_bandwidth_delegation_trx_per_invoice = float(os.getenv("MAX_BANDWIDTH_DELEGATION_TRX_PER_INVOICE", "5.0"))
-        
+
+        # Delegation behavior tuning
+        # Small safety multiplier to overshoot targets and avoid landing just below thresholds
+        self.delegation_safety_multiplier = float(os.getenv("DELEGATION_SAFETY_MULTIPLIER", "1.1"))
+        # Network minimum for delegate_resource is 1 TRX; allow override but clamp to >= 1.0 in code
+        self.min_delegate_trx = float(os.getenv("MIN_DELEGATE_TRX", "1.0"))
+
         # Account activation mode: 'transfer' (send TRX) or 'create_account' (no TRX transfer)
         self.account_activation_mode = os.getenv("GAS_ACCOUNT_ACTIVATION_MODE", "transfer").lower()
         if self.account_activation_mode not in {"transfer", "create_account"}:
             logger.warning("Invalid GAS_ACCOUNT_ACTIVATION_MODE=%s, falling back to 'transfer'", self.account_activation_mode)
             self.account_activation_mode = "transfer"
-        
+
         # Validation
         self._validate_config()
     
@@ -197,6 +205,19 @@ class APIConfig:
         self.debug = os.getenv("API_DEBUG", "false").lower() == "true"
         self.base_url = os.getenv("API_BASE_URL", f"http://localhost:{self.port}")
 
+class KeeperConfig:
+    """Keeper bot configuration (activation queue behavior, etc.)"""
+
+    def __init__(self):
+        # Number of background workers processing activation jobs
+        self.activation_queue_workers = int(os.getenv("KEEPER_ACTIVATION_QUEUE_WORKERS", "1"))
+        # When true, activation jobs run synchronously (useful in tests/integration)
+        self.activation_queue_sync = os.getenv("KEEPER_ACTIVATION_QUEUE_SYNC", "false").lower() == "true"
+        # Default retries per activation job
+        self.activation_queue_retries = int(os.getenv("KEEPER_ACTIVATION_QUEUE_RETRIES", "3"))
+        # Default backoff seconds between retries
+        self.activation_queue_backoff_sec = float(os.getenv("KEEPER_ACTIVATION_QUEUE_BACKOFF_SEC", "5.0"))
+
 class Config:
     """Main configuration class"""
     
@@ -205,6 +226,7 @@ class Config:
         self.database = DatabaseConfig()
         self.bot = BotConfig()
         self.api = APIConfig()
+        self.keeper = KeeperConfig()
         
         # Logging
         self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
