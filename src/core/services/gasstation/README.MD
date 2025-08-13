@@ -1,4 +1,5 @@
-# Gas Station Module
+source .venv/bin/activate
+PYTHONPATH=src pytest -q# Gas Station Module
 
 The Gas Station module provides comprehensive TRON resource management for PortoAPI's USDT operations.
 

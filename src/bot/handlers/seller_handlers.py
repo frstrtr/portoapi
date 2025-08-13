@@ -24,10 +24,9 @@ try:
         get_wallets_by_seller,
         get_wallet_by_group,
         get_transactions_by_invoice,
-        get_free_gas_usage,
-        increment_free_gas_usage,
         record_free_gas_address,
         reset_free_gas_usage_today,
+    get_free_gas_usage,
     )
 except ImportError:
     from src.core.database.db_service import (
@@ -42,10 +41,9 @@ except ImportError:
         get_wallets_by_seller,
         get_wallet_by_group,
         get_transactions_by_invoice,
-        get_free_gas_usage,
-        increment_free_gas_usage,
         record_free_gas_address,
         reset_free_gas_usage_today,
+    get_free_gas_usage,
     )
 try:
     import core.database.db_service as db_service  # used by tests' mocks
@@ -60,13 +58,11 @@ try:
     from core.services.gas_station import (
         get_or_create_tron_deposit_address,
         prepare_for_sweep,
-        estimate_usdt_transfer_consumption,
     )
 except ImportError:
     from src.core.services.gas_station import (
         get_or_create_tron_deposit_address,
         prepare_for_sweep,
-        estimate_usdt_transfer_consumption,
     )
 
 # Import new gas station module
@@ -196,7 +192,7 @@ class SweepFSM(StatesGroup):
 class WithdrawFSM(StatesGroup):
     choose_mode = State()      # выбрать какие инвойсы выводить
     ask_destination = State()  # спросить адрес назначения
-    await_signed = State()     # ожидание подписанных транзакций для броадкаста
+    await_signed = State()     # ожидание подписанных транзакций для броадкаст
 
 
 async def handle_main_command_interrupt(message: types.Message, state: FSMContext):
@@ -225,21 +221,8 @@ async def handle_myaccount(message: types.Message):
                 reply_markup=get_main_menu_keyboard(is_registered=False),
             )
             return
-
-        # Get user info from Telegram
-        user = message.from_user
-        user_info = []
-        user_info.append("👤 <b>Информация о пользователе:</b>")
-        user_info.append(f"• ID: <code>{user.id}</code>")
-        fn = html.escape(user.first_name) if user.first_name else "Не указано"
-        user_info.append(f"• Имя: {fn}")
-        if user.last_name:
-            user_info.append(f"• Фамилия: {html.escape(user.last_name)}")
-        if user.username:
-            user_info.append(f"• Username: @{html.escape(user.username)}")
-        else:
-            user_info.append("• Username: Не указан")
-
+        # Aggregate user info lines
+        user_info: list[str] = []
         # Registration date
         if seller.date_created:
             reg_date = seller.date_created.strftime("%d.%m.%Y %H:%M")
@@ -269,6 +252,32 @@ async def handle_myaccount(message: types.Message):
                     )
         else:
             user_info.append("• Нет настроенных кошельков")
+
+        # Deterministic user-specific address (first available xPub, account = telegram_id, index 0)
+        deterministic_addr = None
+        primary_xpub = None
+        try:
+            if buyer_groups:
+                for g in buyer_groups:
+                    if g.xpub:
+                        primary_xpub = g.xpub
+                        break
+            if not primary_xpub:
+                wallets_tmp = get_wallets_by_seller(db, telegram_id)
+                for w in wallets_tmp:
+                    if w.xpub:
+                        primary_xpub = w.xpub
+                        break
+            if primary_xpub:
+                # Use telegram_id as BIP44 account index (bounded)
+                acct_index = int(telegram_id) % 2_147_483_000
+                deterministic_addr = generate_address_from_xpub(primary_xpub, index=0, account=acct_index)
+        except Exception:
+            deterministic_addr = None
+        if deterministic_addr:
+            user_info.append("\n🧬 <b>Детерминированный адрес (по Telegram ID):</b>")
+            user_info.append(f"• Path: m/44'/195'/{int(telegram_id)%2_147_483_000}'/0/0")
+            user_info.append(f"• Address: <code>{html.escape(deterministic_addr)}</code>")
 
         # Get wallets information
         wallets = get_wallets_by_seller(db, telegram_id)
@@ -307,10 +316,40 @@ async def handle_myaccount(message: types.Message):
         user_info.append(f"• Частично оплачено: {partial_invoices}")
         user_info.append(f"• В ожидании: {pending_invoices}")
 
+        # Aggregate invoice amounts
+        try:
+            total_paid_amount = sum(float(inv.amount or 0) for inv in invoices if inv.status == 'paid')
+        except Exception:
+            total_paid_amount = 0.0
+        # For partial invoices compute received so far
+        partial_received_total = 0.0
+        partial_outstanding_total = 0.0
+        try:
+            for inv in [i for i in invoices if i.status == 'partial']:
+                try:
+                    txs = get_transactions_by_invoice(db, inv.id)
+                    received = sum(float(t.amount_received or 0) for t in txs)
+                except Exception:
+                    received = 0.0
+                outstanding = max(0.0, float(inv.amount) - received)
+                partial_received_total += received
+                partial_outstanding_total += outstanding
+        except Exception:
+            pass
+        try:
+            pending_amount_total = sum(float(inv.amount or 0) for inv in invoices if inv.status == 'pending')
+        except Exception:
+            pending_amount_total = 0.0
+        user_info.append("\n💰 <b>Суммы по инвойсам:</b>")
+        user_info.append(f"• Оплачено всего: {total_paid_amount:.2f} USDT")
+        if partial_invoices:
+            user_info.append(f"• Получено по частичным: {partial_received_total:.2f} USDT (осталось {partial_outstanding_total:.2f} USDT)")
+        user_info.append(f"• В ожидании (pending): {pending_amount_total:.2f} USDT")
+
         # Details for partially paid invoices
         if partial_invoices:
             user_info.append("\n🟡 <b>Частично оплаченные инвойсы:</b>")
-            for inv in [i for i in invoices if inv.status == 'partial']:
+            for inv in [i for i in invoices if i.status == 'partial']:
                 try:
                     txs = get_transactions_by_invoice(db, inv.id)
                     total_received = sum(float(t.amount_received or 0) for t in txs)
@@ -325,6 +364,23 @@ async def handle_myaccount(message: types.Message):
         # Gas station balance
         user_info.append("\n⛽ <b>Газовый депозит:</b>")
         user_info.append(f"• Баланс: {seller.gas_deposit_balance:.2f} TRX")
+        # Deposit address & recommendation
+        try:
+            deposit_address = get_or_create_tron_deposit_address(db, seller_id=telegram_id)
+            rec_amt = _recommend_trx_needed(seller)
+            user_info.append(f"• Адрес депозита: <code>{html.escape(deposit_address)}</code>")
+            user_info.append(f"• Рекомендуемый депозит: {rec_amt:.2f} TRX")
+        except Exception:
+            pass
+
+        # Free gas usage info (if record exists)
+        try:
+            usage = get_free_gas_usage(db, seller_id=telegram_id)
+            if usage:
+                user_info.append("\n🆓 <b>Free Gas сегодня:</b>")
+                user_info.append(f"• Использовано попыток: {usage.used_count}")
+        except Exception:
+            pass
 
         response_text = "\n".join(user_info)
 
@@ -333,13 +389,18 @@ async def handle_myaccount(message: types.Message):
             parse_mode="HTML",
             reply_markup=get_main_menu_keyboard(is_registered=True),
         )
-
-    except Exception as e:
-        logger.exception(f"Error in handle_myaccount for user {telegram_id}: {e}")
-        await message.answer(
-            "❌ Произошла ошибка при получении информации об аккаунте.",
-            reply_markup=get_main_menu_keyboard(is_registered=True),
-        )
+    except Exception as e:  # pragma: no cover
+        try:
+            logger.exception(f"Error in handle_myaccount for user {telegram_id}: {e}")
+        except Exception:
+            pass
+        try:
+            await message.answer(
+                "❌ Произошла ошибка при получении информации об аккаунте.",
+                reply_markup=get_main_menu_keyboard(is_registered=True),
+            )
+        except Exception:
+            pass
 
 
 async def handle_register(message: types.Message, state: FSMContext = None):
@@ -383,6 +444,52 @@ async def handle_register(message: types.Message, state: FSMContext = None):
     )
     if state is not None:
         await state.set_state(RegisterFSM.get_xpub)
+
+async def process_register_xpub(message: types.Message, state: FSMContext):
+    """Handle xPub submission during initial /register flow."""
+    telegram_id = message.from_user.id
+    txt = (message.text or "").strip()
+    db = _get_bot_db(message)
+    # Allow cancel
+    if txt.lower() in {"/cancel", "cancel", "отмена"}:
+        await message.answer("Регистрация отменена.")
+        await state.clear()
+        return
+    # Provide instructions
+    if txt.lower() in {"нет", "no", "help", "?"}:
+        await message.answer(
+            "Чтобы получить xPub: в вашем кошельке (например, Trust / Unisat и т.п.) найдите функцию экспорта расширенного публичного ключа (xpub/ypub/zpub) для нужной seed-фразы. Отправьте сюда строку, начинающуюся на xpub/ypub/zpub."
+        )
+        return
+    if not is_valid_xpub(txt):
+        await message.answer("Некорректный xPub. Отправьте действительный xPub или напишите 'нет' для инструкции.")
+        return
+    # Determine next available account index for buyer groups (use as wallet grouping)
+    try:
+        groups = get_buyer_groups_by_seller(db, telegram_id)
+    except Exception:
+        groups = []
+    used_accounts = {g.invoices_group for g in groups}
+    next_account = 0
+    while next_account in used_accounts:
+        next_account += 1
+    # Use buyer_id 'General' for first group if free
+    buyer_id = "General" if all(getattr(g, 'buyer_id', '').lower() != 'general' for g in groups) else f"Wallet{next_account}"
+    try:
+        create_buyer_group(
+            db,
+            seller_id=telegram_id,
+            buyer_id=buyer_id,
+            invoices_group=next_account,
+            xpub=txt,
+        )
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"process_register_xpub failed to create group for {telegram_id}: {e}")
+        await message.answer("Не удалось сохранить xPub. Попробуйте позже или /cancel.")
+        return
+    await message.answer(f"xPub сохранён. Добавлена группа '{buyer_id}' (account {next_account}). Регистрация завершена.")
+    await show_main_menu(message, state)
+    await state.clear()
 
 
 # --- Registration FSM choice handlers ---
@@ -519,6 +626,7 @@ async def handle_balance(message: types.Message):
 
     # Resolve deposit address and on-chain pending balance
     pending_trx = 0.0
+    gas_main_address = ""
     try:
         # Ensure a deposit address exists
         deposit_address = get_or_create_tron_deposit_address(db, seller_id=telegram_id)
@@ -536,6 +644,19 @@ async def handle_balance(message: types.Message):
                 pending_trx = 0.0
         except Exception as e:
             logger.warning(f"Could not fetch on-chain TRX balance for {telegram_id}: {e}")
+        # Gas station main (hot) wallet address
+        try:
+            from src.core.services.gas_station import gas_station as _gs  # type: ignore
+        except ImportError:
+            try:
+                from core.services.gas_station import gas_station as _gs  # type: ignore
+            except Exception:
+                _gs = None  # type: ignore
+        if _gs is not None:
+            try:
+                gas_main_address = _gs.get_gas_wallet_address()
+            except Exception:
+                gas_main_address = ""
     except Exception as e:
         logger.warning(f"Failed to resolve deposit address for {telegram_id}: {e}")
         deposit_address = 'N/A'
@@ -543,13 +664,28 @@ async def handle_balance(message: types.Message):
     logger.info(
         f"User {telegram_id} balance: credited={credited_trx} TRX, pending_onchain={pending_trx} TRX"
     )
+    # Recommendation (reuse logic from myaccount)
+    try:
+        recommended = _recommend_trx_needed(seller)
+    except Exception:
+        recommended = 0.0
+
+    extra_lines = []
+    if gas_main_address:
+        if gas_main_address == deposit_address:
+            extra_lines.append("Главный адрес газовой станции совпадает с адресом вашего депозита (shared).")
+        else:
+            extra_lines.append(f"Главный адрес газовой станции (горячий кошелёк): <code>{gas_main_address}</code>")
+    if recommended > 0:
+        extra_lines.append(f"Рекомендуемый депозит: <b>{recommended:.2f} TRX</b>")
 
     text = (
         f"Ваш баланс: <b>{credited_trx:.6f} TRX</b>\n"
         f"Ожидает зачисления на адрес депозита: <b>{pending_trx:.6f} TRX</b>\n\n"
         f"Адрес депозита TRX: <code>{deposit_address}</code>\n"
-        f"Средства на адресе будут автоматически переведены на горячий кошелек и зачислены.\n\n"
-        f"Подсказка: после пополнения вы можете восстановить бесплатные попытки на сегодня командой /restore_free_gas"
+        + ("\n".join(extra_lines) + "\n\n" if extra_lines else "\n")
+        + "Средства на адресе будут автоматически переведены на горячий кошелек и зачислены.\n\n"
+        + "Подсказка: после пополнения вы можете восстановить бесплатные попытки на сегодня командой /restore_free_gas"
     )
     await message.answer(text, parse_mode="HTML")
 
@@ -753,6 +889,270 @@ async def process_invoice_group(message: types.Message, state: FSMContext):
             caption=f"QR-код для инвойса: {invoice.address}",
         )
     await state.clear()
+
+
+async def handle_invoices(message: types.Message):
+    """List recent invoices for the user (basic summary)."""
+    telegram_id = message.from_user.id
+    db = _get_bot_db(message)
+    try:
+        invs = get_invoices_by_seller(db, telegram_id)
+        if not invs:
+            await message.answer("У вас пока нет инвойсов.")
+            return
+        # Show up to 15 latest by id desc
+        invs_sorted = sorted(invs, key=lambda i: getattr(i, 'id', 0), reverse=True)[:15]
+        lines = ["Ваши последние инвойсы:"]
+        for inv in invs_sorted:
+            try:
+                amt = float(getattr(inv, 'amount', 0) or 0)
+            except Exception:
+                amt = 0.0
+            status = getattr(inv, 'status', 'unknown')
+            addr = getattr(inv, 'address', '') or ''
+            short_addr = (addr[:8] + '...' + addr[-6:]) if addr and len(addr) > 16 else addr
+            lines.append(f"#{getattr(inv,'id','?')} {amt:.2f} USDT {status} {short_addr}")
+        await message.answer("\n".join(lines))
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"handle_invoices failed for {telegram_id}: {e}")
+        await message.answer("Не удалось получить список инвойсов.")
+
+
+# --- Withdraw flow (simplified placeholder) ---
+async def handle_withdraw(message: types.Message, state: FSMContext | None = None):
+    """Entry point for /withdraw - simplified: list swept invoices only."""
+    telegram_id = message.from_user.id
+    db = _get_bot_db(message)
+    try:
+        invs = get_invoices_by_seller(db, telegram_id)
+    except Exception:
+        invs = []
+    swept = [i for i in invs if getattr(i, 'status', '') == 'swept']
+    if not swept:
+        await message.answer("Нет средств для вывода (нет swept инвойсов).")
+        return
+    total = 0.0
+    for i in swept:
+        try:
+            total += float(getattr(i, 'amount', 0) or 0)
+        except Exception:
+            pass
+    await message.answer(f"Доступно для вывода (упрощённо): {total:.2f} USDT по {len(swept)} инвойсам. Укажите адрес назначения или /cancel.")
+    if state is not None:
+        await state.set_state(WithdrawFSM.ask_destination)
+
+
+async def process_withdraw_mode_choice(message: types.Message, state: FSMContext):
+    # Placeholder to satisfy dispatcher; reuse handle_withdraw
+    await handle_withdraw(message, state)
+
+
+async def process_withdraw_destination(message: types.Message, state: FSMContext):
+    dest = (message.text or '').strip()
+    if dest.lower() in {"/cancel", "cancel", "отмена"}:
+        await message.answer("Отменено.")
+        await state.clear()
+        return
+    # Basic TRON address format check
+    if not _is_valid_tron_address(dest):
+        await message.answer("Некорректный адрес TRON. Отправьте корректный или /cancel.")
+        return
+    await message.answer("Формирование транзакций вывода не реализовано в этой сборке (placeholder).")
+    await state.clear()
+
+
+async def process_withdraw_signed(message: types.Message, state: FSMContext):
+    await message.answer("Обработка подписанных транзакций недоступна (placeholder).")
+    await state.clear()
+
+
+# --- Gas station & keeper placeholder handlers (re-added after refactor) ---
+async def handle_gasstation(message: types.Message):
+    """Richer gas station status (restored)."""
+    try:
+        processing_msg = await message.answer("⏳ Getting gas station status...")
+        # Prefer new unified gas_station manager; fallback to legacy service if present
+        try:
+            from src.core.services.gas_station import gas_station as _gs  # type: ignore
+            address = _gs.get_gas_wallet_address()
+            network = getattr(_gs.tron_config, 'network', 'tron')
+            # Comprehensive summary (delegated + self stake, expected yields, balances)
+            summary = _gs.get_owner_stake_generation_summary(include_raw=True)
+            # Liquid TRX balance (already in summary['available_trx']) but fallback via client if missing
+            liquid = float(summary.get("available_trx", 0.0) or 0.0)
+            if not liquid:
+                try:
+                    bal = _gs.client.get_account_balance(address) if getattr(_gs, 'client', None) else 0
+                    liquid = float(bal)
+                except Exception:
+                    pass
+            energy_stake = float(summary.get("energy_trx", 0.0) or 0.0)
+            bandwidth_stake = float(summary.get("bandwidth_trx", 0.0) or 0.0)
+            total_stake = float(summary.get("total_staked_trx", energy_stake + bandwidth_stake) or 0.0)
+            exp_e = int(summary.get("expected_energy_units", 0) or 0)
+            exp_bw = int(summary.get("expected_bandwidth_units", 0) or 0)
+            daily_e_per_trx = float(summary.get("dailyEnergyPerTrx", 0.0) or 0.0)
+            daily_bw_per_trx = float(summary.get("dailyBandwidthPerTrx", 0.0) or 0.0)
+            rewards = float(summary.get("stake_rewards_trx", 0.0) or 0.0)
+            # Detect if dynamic on-chain params were successfully used
+            raw_params = (summary.get("raw") or {}).get("global_params", {}) if isinstance(summary.get("raw"), dict) else {}
+            dynamic_params = bool(raw_params.get("totalEnergyLimit", 0) > 0 and raw_params.get("totalEnergyWeightSun", 0) > 0)
+            operational = exp_e > 0 and exp_bw > 0
+            response = ["⛽ Gas Station Status", f"🏦 Address: <code>{html.escape(address)}</code>"]
+            response.append(f"💰 Liquid Balance: {liquid:.2f} TRX")
+            response.append(f"🪙 Stake: ENERGY {energy_stake:.3f} TRX • BANDWIDTH {bandwidth_stake:.3f} TRX • Total {total_stake:.3f} TRX")
+            response.append("📊 Daily Generation (expected):")
+            def _fmt_units(v: int) -> str:
+                if v >= 1_000_000_000:
+                    return f"{v/1_000_000_000:.2f}B"
+                if v >= 1_000_000:
+                    return f"{v/1_000_000:.2f}M"
+                if v >= 1000:
+                    return f"{v/1000:.2f}K"
+                return f"{v}"  # small numbers raw
+            response.append(f"   ⚡ Energy: {_fmt_units(exp_e)} (≈{exp_e:,} units)")
+            response.append(f"   📡 Bandwidth: {_fmt_units(exp_bw)} (≈{exp_bw:,} units)")
+            response.append(f"   Yield/Stake Ratios: ⚡ {daily_e_per_trx:.2f} u/TRX/day • 📡 {daily_bw_per_trx:.2f} u/TRX/day")
+            if rewards > 0:
+                response.append(f"🎁 Pending Rewards: {rewards:.6f} TRX")
+            response.append(f"🔗 Network: {network} ({'dynamic' if dynamic_params else 'config est.'} yields)")
+            if 'warning' in summary:
+                response.append(f"⚠️ {html.escape(str(summary['warning']))}")
+            response.append(f"✅ Status: {'Online' if operational else 'Degraded'}")
+            response.append("\n🔧 Management Commands:\n• /gasstation_stake\n• /gasstation_delegate\n• /gasstation_withdraw")
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
+            await message.answer("\n".join(response), parse_mode="HTML")
+        except Exception:
+            # Fallback to legacy GasStationService if still available
+            try:
+                from core.services.gasstation import GasStationService  # type: ignore
+            except Exception:
+                from src.core.services.gasstation import GasStationService  # pragma: no cover
+            try:
+                from core.config import config as _cfg
+            except Exception:
+                from src.core.config import config as _cfg  # pragma: no cover
+            try:
+                import asyncio as _asyncio
+                gas_station_service = GasStationService(_cfg.tron)
+                status = await _asyncio.wait_for(_asyncio.to_thread(gas_station_service.get_status), timeout=20.0)
+                await processing_msg.delete()
+                response = ["⛽ Gas Station Status (legacy)", f"🏦 Address: <code>{html.escape(status.get('address',''))}</code>"]
+                response.append(f"💰 TRX Balance: {status.get('balance',0):.2f} TRX")
+                response.append(f"🔗 Network: {status.get('network','tron')}")
+                await message.answer("\n".join(response), parse_mode="HTML")
+            except Exception:
+                if 'processing_msg' in locals():
+                    try: await processing_msg.delete()
+                    except Exception: pass
+                await message.answer("❌ Error retrieving gas station status.")
+    except Exception as e:
+        await message.answer(f"❌ Error retrieving gas station status. <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+
+
+async def handle_gasstation_stake(message: types.Message):
+    await message.answer("Команда стейкинга пока недоступна через бота.")
+
+
+async def handle_gasstation_delegate(message: types.Message):
+    await message.answer("Делегация через команду временно отключена.")
+
+
+async def handle_gasstation_withdraw(message: types.Message):
+    await message.answer("Вывод стейка через команду временно отключён.")
+
+
+async def handle_keeper_status(message: types.Message):
+    """Heuristic keeper bot status check (restored)."""
+    import subprocess
+    keeper_running = False
+    try:
+        result = subprocess.run(["pgrep", "-f", "keeper_bot.py"], capture_output=True, text=True, timeout=5, check=False)
+        keeper_running = bool(result.stdout.strip())
+    except Exception:
+        pass
+    recent_log_line = None
+    try:
+        with open("bot.log", "r", encoding="utf-8") as f:
+            lines = f.readlines()[-200:]
+        keeper_lines = [l for l in lines if "keeper_bot" in l]
+        if keeper_lines:
+            recent_log_line = keeper_lines[-1].strip()
+            # If last log within 10 minutes assume running
+            keeper_running = True
+    except Exception:
+        pass
+    resp = ["🤖 Keeper Bot Status", f"Status: {'✅ Running' if keeper_running else '❌ Not detected'}"]
+    if recent_log_line:
+        resp.append("Last log: " + html.escape(recent_log_line[-180:]))
+    await message.answer("\n".join(resp), parse_mode="HTML")
+
+
+async def handle_keeper_logs(message: types.Message):
+    try:
+        with open("bot.log", "r", encoding="utf-8") as f:
+            lines = f.readlines()[-100:]
+        keeper_lines = [l for l in lines if "keeper_bot" in l][-40:]
+        if not keeper_lines:
+            await message.answer("Логи keeper бот отсутствуют.")
+            return
+        text = "Последние логи keeper:\n" + "".join(keeper_lines)[-3500:]
+        await message.answer(f"<code>{html.escape(text)}</code>", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"Не удалось прочитать логи: {e}")
+
+
+async def handle_estimate_usdt(message: types.Message):
+    """Estimate resources & delegation needs for a USDT transfer.
+    Usage: /estimate_usdt [amount] [from_address(optional)] [to_address(optional)]
+    Defaults: amount=1, from=sample placeholder (will fallback), to=owner address.
+    """
+    parts = (message.text or "").strip().split()
+    amount = 1.0
+    from_addr = None
+    to_addr = None
+    if len(parts) >= 2:
+        try:
+            amount = float(parts[1])
+        except Exception:
+            await message.answer("Некорректная сумма. Пример: /estimate_usdt 5")
+            return
+    if len(parts) >= 3:
+        from_addr = parts[2]
+    if len(parts) >= 4:
+        to_addr = parts[3]
+    if amount <= 0:
+        await message.answer("Сумма должна быть > 0")
+        return
+    try:
+        try:
+            from core.services.gas_station import gas_station as _gs, estimate_usdt_transfer_consumption as _est
+        except ImportError:  # pragma: no cover
+            from src.core.services.gas_station import gas_station as _gs, estimate_usdt_transfer_consumption as _est  # type: ignore
+        if to_addr is None:
+            try:
+                to_addr = _gs.get_gas_wallet_address()
+            except Exception:
+                to_addr = from_addr or "TPLACEHOLDER"  # benign fallback
+        if from_addr is None:
+            from_addr = to_addr  # self-estimate if not provided
+        data = _est(from_address=from_addr, to_address=to_addr, amount_usdt=amount)
+    except Exception as e:  # pragma: no cover
+        await message.answer(f"Не удалось выполнить оценку: {e}")
+        return
+    en = data.get("energy_used") or data.get("energy_used_estimate") or 0
+    bw = data.get("bandwidth_used") or data.get("bandwidth_used_estimate") or 0
+    fee_trx = data.get("fee_trx") or data.get("fee") or 0
+    lines = [
+        f"Оценка перевода {amount:.2f} USDT:",
+        f"Energy: {en}",
+        f"Bandwidth: {bw}",
+        f"Fee (TRX, approx): {fee_trx}",
+    ]
+    await message.answer("\n".join(lines))
 
 
 # --- Покупатели/группы ---
@@ -1176,297 +1576,169 @@ def _is_valid_tron_address(addr: str) -> bool:
 async def handle_free_gas(message: types.Message, state: FSMContext | None = None):
     """Entry point for /free_gas: ask the user for a TRON address to activate/top-up."""
     try:
-        # Determine if user is registered (has any xpub)
         db = _get_bot_db(message)
-        seller = get_seller(db, message.from_user.id)
-        wallets = get_wallets_by_seller(db, message.from_user.id) if seller else []
-        groups = get_buyer_groups_by_seller(db, message.from_user.id) if seller else []
-        has_xpub = any(getattr(w, 'xpub', None) for w in wallets) or any(getattr(g, 'xpub', None) for g in groups)
-
-        # Daily limits: unregistered = 1/day, registered = 3/day
-        usage = get_free_gas_usage(db, message.from_user.id)
-        used_today = int(getattr(usage, 'used_count', 0) or 0)
-        limit = 3 if has_xpub else 1
-        if used_today >= limit:
-            await message.answer(f"Лимит Free Gas на сегодня исчерпан ({used_today}/{limit}). Приходите завтра.")
-            if state is not None:
-                await state.clear()
-            await show_main_menu(message)
+        telegram_id = message.from_user.id
+        # Light eligibility check (registered user with at least one wallet or buyer group)
+        try:
+            seller = get_seller(db, telegram_id)
+            has_any = False
+            if seller:
+                try:
+                    if get_wallets_by_seller(db, telegram_id):
+                        has_any = True
+                except Exception:
+                    pass
+                try:
+                    if get_buyer_groups_by_seller(db, telegram_id):
+                        has_any = True
+                except Exception:
+                    pass
+            if not has_any:
+                await message.answer("Сначала завершите регистрацию и добавьте хотя бы один xPub через /register.")
+                return
+        except Exception:
+            await message.answer("Не удалось проверить регистрацию. Попробуйте позже.")
             return
 
-        from aiogram.types import ReplyKeyboardRemove
-        suffix = f" (сегодня использовано {used_today}/{limit})" if used_today else f" (лимит сегодня: {limit})"
-        await message.answer(
-            "Отправьте TRON-адрес (T...), который нужно активировать и подготовить к выводу (1 USDT)." + suffix,
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        # Prompt user for address
         if state is not None:
             await state.set_state(FreeGasFSM.ask_address)
-    except Exception:
-        await message.answer("Не удалось запустить режим Free Gas. Попробуйте позже.")
+        await message.answer(
+            "🆓 Введите TRON адрес для одноразовой активации и делегации ресурсов (для 1 USDT перевода).\n"
+            "Отправьте адрес формата, начинающегося на 'T'."
+        )
+    except Exception as e:  # pragma: no cover
+        logger.exception(f"Error in handle_free_gas: {e}")
+        await message.answer("Ошибка обработки команды.")
 
 
 async def process_free_gas_address(message: types.Message, state: FSMContext):
+    """Validate address and show preview (dry-run) of what would be delegated."""
     addr = (message.text or "").strip()
+    if addr.lower() in {"/cancel", "cancel", "отмена"}:
+        await message.answer("Отменено.")
+        await state.clear()
+        return
     if not _is_valid_tron_address(addr):
-        await message.answer("Некорректный адрес TRON. Отправьте адрес, начинающийся с 'T'.")
+        await message.answer("Некорректный TRON адрес. Проверьте и отправьте снова или /cancel.")
         return
-
-    telegram_id = message.from_user.id  # define early for logging
-
-    # Enforce daily limit again at action time
+    # Acquire dry-run plan
     try:
-        db = _get_bot_db(message)
-        seller = get_seller(db, telegram_id)
-        wallets = get_wallets_by_seller(db, telegram_id) if seller else []
-        groups = get_buyer_groups_by_seller(db, telegram_id) if seller else []
-        has_xpub = any(getattr(w, 'xpub', None) for w in wallets) or any(getattr(g, 'xpub', None) for g in groups)
-        usage = get_free_gas_usage(db, telegram_id)
-        used_today = int(getattr(usage, 'used_count', 0) or 0)
-        limit = 3 if has_xpub else 1
-        if used_today >= limit:
-            await message.answer(f"Лимит Free Gas на сегодня исчерпан ({used_today}/{limit}). Приходите завтра.")
-            if state is not None:
-                await state.clear()
-            await show_main_menu(message)
-            return
-    except Exception:
-        has_xpub = False
-        limit = 1
-
-    # Proceed with top-up activation
-    try:
-        db = _get_bot_db(message)
-        # Persist the address for future use/analytics (best-effort)
         try:
-            record_free_gas_address(db, telegram_id, addr)
-        except Exception:
-            pass
+            from core.services.gas_station import gas_station as _gs
+        except ImportError:  # pragma: no cover
+            from src.core.services.gas_station import gas_station as _gs  # type: ignore
+        plan = _gs.dry_run_prepare_for_sweep(addr)
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"dry_run_prepare_for_sweep failed for {addr}: {e}")
+        plan = {"error": str(e)}
 
-        ok = prepare_for_sweep(addr)
-        if not ok:
-            await message.answer("❌ Не удалось подготовить адрес. Попробуйте позже.")
-            return
-
-        # Increment today's usage counter
-        try:
-            used_now = increment_free_gas_usage(db, telegram_id)
-        except Exception:
-            used_now = None
-
-        # Build usage suffix
-        suffix = ""
-        try:
-            cur_used = used_now if isinstance(used_now, int) else int(get_free_gas_usage(db, telegram_id).used_count or 0)
-            suffix = f" (сегодня {cur_used}/{limit})"
-        except Exception:
-            suffix = ""
-
-        short = (addr[:8] + "..." + addr[-6:]) if len(addr) > 16 else addr
-        await message.answer(
-            f"✅ Адрес <code>{short}</code> активирован и подготовлен к выводу 1 USDT.{suffix}",
-            parse_mode="HTML",
-        )
-        if state is not None:
-            await state.clear()
-        await show_main_menu(message)
-    except Exception as e:
-        logger.exception(f"Error in Free Gas activation for user {telegram_id}: {e}")
-        await message.answer("❌ Произошла ошибка при активации Free Gas. Попробуйте позже.")
-        await state.clear()
-
-
-# --- Invoices list ---
-async def handle_invoices(message: types.Message):
-    telegram_id = message.from_user.id
-    db = _get_bot_db(message)
-    try:
-        invoices = get_invoices_by_seller(db, telegram_id)
-        if not invoices:
-            await message.answer("У вас нет инвойсов. Используйте /create_invoice.")
-            return
-        lines = ["Ваши инвойсы:"]
-        for inv in invoices[:50]:  # cap output
-            status = getattr(inv, 'status', 'pending')
-            amt = getattr(inv, 'amount', 0)
-            addr = getattr(inv, 'address', '')
-            short = (addr[:8] + '...' + addr[-6:]) if addr and len(addr) > 16 else addr
-            lines.append(f"#{inv.id} {status} {amt} USDT {short}")
-        await message.answer("\n".join(lines))
-    except Exception as e:
-        logger.warning(f"handle_invoices failed for {telegram_id}: {e}")
-        await message.answer("Не удалось получить список инвойсов.")
-
-
-# --- GasStation status (stub) ---
-async def handle_gasstation(message: types.Message):
-    try:
-        from src.core.services.gas_station import gas_station
-        base = config.tron.get_tron_client_config().get("full_node")
-        owner = gas_station.get_gas_wallet_address()
-        summary = gas_station.get_owner_stake_generation_summary(owner, include_raw=False, scale_1e6=True)
-        # Build compact table similar to test output
-        energy_trx = summary.get("energy_trx", 0.0)
-        bandwidth_trx = summary.get("bandwidth_trx", 0.0)
-        # Use actual per-TRX yields (already corrected to real units)
-        d_e = summary.get("dailyEnergyPerTrx", 0.0)
-        d_b = summary.get("dailyBandwidthPerTrx", 0.0)
-        e_units = summary.get("expected_energy_units", 0)
-        b_units = summary.get("expected_bandwidth_units", 0)
-        avail_trx = summary.get("available_trx", 0.0)
-        total_staked = summary.get("total_staked_trx", 0.0)
-        rewards_trx = summary.get("stake_rewards_trx", 0.0)
-        lines = [
-            "⛽ GasStation",
-            "Stake (TRX): Energy {:.0f} | Bandwidth {:.0f}".format(energy_trx, bandwidth_trx),
-            "Balances:",
-            "  • Available TRX : {:.2f}".format(avail_trx),
-            "  • Total Staked  : {:.2f}".format(total_staked),
-            "  • Rewards (TRX) : {:.2f}".format(rewards_trx),
-            "Daily Generation:",
-            "  • Energy  : {} units".format(_fmt_large(e_units)),
-            "  • Bandwidth: {} bytes".format(_fmt_large(b_units)),
-            "Yield per 1 TRX per day:",
-            "  • Energy  : {:.2f} units".format(d_e),
-            "  • Bandwidth: {:.3f} bytes".format(d_b),
-            f"Node: {base}",
-        ]
-        if energy_trx == 0 and bandwidth_trx == 0:
-            lines.append("⚠️ Stake is zero (no ENERGY/BANDWIDTH detected)")
-        await message.answer("\n".join(lines))
-    except Exception:
-        # Fallback to simple health probe
-        try:
-            import requests
-            base = config.tron.get_tron_client_config().get("full_node")
-            r = requests.get(f"{base}/wallet/getnowblock", timeout=5)
-            ok = r.ok
-            await message.answer(f"GasStation: node={'OK' if ok else 'FAIL'} base={base}")
-        except Exception:
-            await message.answer("GasStation: недоступно сейчас.")
-
-
-async def handle_keeper_status(message: types.Message):
-    await message.answer("Keeper: работает (см. логи).")
-
-
-async def handle_keeper_logs(message: types.Message):
-    await message.answer("Логи недоступны в боте. Проверьте серверные логи.")
-
-
-async def handle_gasstation_stake(message: types.Message):
-    await message.answer("Стейкинг через бота пока не реализован.")
-
-
-async def handle_gasstation_delegate(message: types.Message):
-    await message.answer("Делегирование через бота пока не реализовано.")
-
-
-async def handle_gasstation_withdraw(message: types.Message):
-    await message.answer("Вывод стейка через бота пока не реализован.")
-
-
-# --- Registration: xpub input handler used by FSM ---
-async def process_register_xpub(message: types.Message, state: FSMContext):
-    telegram_id = message.from_user.id
-    db = _get_bot_db(message)
-    text = (message.text or '').strip()
-    if text.lower() in {"нет", "no", "/cancel", "cancel", "отмена"}:
-        await message.answer("Ок. Вы можете добавить покупателя и xPub позже через /add_buyer.")
+    if plan.get("error"):
+        await message.answer(f"Не удалось смоделировать делегацию: {html.escape(plan['error'])}")
         await state.clear()
         return
-    if not is_valid_xpub(text):
-        await message.answer("Некорректный xPub. Отправьте корректный xPub или 'нет'.")
-        return
-    # Ensure seller exists
-    if not get_seller(db, telegram_id):
-        create_seller(db, telegram_id)
-    # Ensure default buyer group exists and set xpub
-    grp = get_buyer_group(db, telegram_id, "General")
-    if not grp:
-        create_buyer_group(db, seller_id=telegram_id, buyer_id="General", invoices_group=0, xpub=text)
-    else:
-        try:
-            grp.xpub = text
-            db.commit()
-        except Exception:
-            pass
-    await message.answer("xPub сохранён для группы 'General'. Теперь вы можете создавать инвойсы.")
-    await show_main_menu(message, state)
-    await state.clear()
 
-
-# --- Withdraw flow (minimal stubs to satisfy FSM) ---
-async def handle_withdraw(message: types.Message, state: FSMContext | None = None):
-    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Все оплаченные")],[KeyboardButton(text="Отмена")]], resize_keyboard=True)
-    await message.answer("Выберите режим вывода:", reply_markup=kb)
-    if state is not None:
-        await state.set_state(WithdrawFSM.choose_mode)
-
-
-async def process_withdraw_mode_choice(message: types.Message, state: FSMContext):
-    choice = (message.text or '').strip()
-    from aiogram.types import ReplyKeyboardRemove
-    if choice.lower().startswith("отмена"):
-        await message.answer("Отменено.", reply_markup=ReplyKeyboardRemove())
-        await state.clear()
-        return
-    await state.update_data(mode=choice)
-    await message.answer("Укажите адрес назначения TRON (T...).", reply_markup=ReplyKeyboardRemove())
-    await state.set_state(WithdrawFSM.ask_destination)
-
-
-async def process_withdraw_destination(message: types.Message, state: FSMContext):
-    dest = (message.text or '').strip()
-    await state.update_data(dest=dest)
-    await message.answer("Подготовка вывода через Mini App пока не реализована в этом билде. Используйте Mini App или повторите позже.")
-    await state.clear()
-
-
-async def process_withdraw_signed(message: types.Message, state: FSMContext):
-    await message.answer("Получены данные подписи. Отправка транзакции пока не реализована.")
-    await state.clear()
-
-
-# --- Free Gas confirm step (compat with FSM wiring) ---
-async def process_free_gas_confirm(message: types.Message, state: FSMContext):
-    await message.answer("Отправьте адрес заново через /free_gas. Подтверждение не требуется.")
-    await state.clear()
-
-
-async def handle_estimate_usdt(message: types.Message):
-    """Show live resource and TRX cost estimation for a USDT transfer from user's invoice address."""
-    telegram_id = message.from_user.id
-    db = _get_bot_db(message)
-    seller = get_seller(db=db, telegram_id=telegram_id) if db else None
-    if not seller:
-        await message.answer("❌ Вы не зарегистрированы. Используйте /register для регистрации.")
-        return
-    # Get invoice address (use main deposit address for now)
-    invoice_address = None
-    try:
-        invoice_address = get_or_create_tron_deposit_address(db, seller_id=telegram_id, deposit_type="TRX")
-    except Exception:
-        invoice_address = None
-    if not invoice_address:
-        await message.answer("❌ Не удалось получить адрес для оценки. Попробуйте позже.")
-        return
-    # Estimate for 1 USDT transfer
-    est = estimate_usdt_transfer_consumption(invoice_address, amount_usdt=1.0)
-    e_used = est.get("energy_used", 0)
-    b_used = est.get("bandwidth_used", 0)
-    cost_trx = est.get("cost_trx", 0.0)
-    fees = est.get("fees", {})
-    e_fee = fees.get("getEnergyFee")
-    b_fee = fees.get("getTransactionFee")
-    lines = [
-        "📊 Оценка ресурсов для перевода 1 USDT (TRC-20):",
-        "• Адрес: <code>{}</code>".format(invoice_address),
-        "• ENERGY: <b>{}</b> единиц".format(e_used),
-        "• BANDWIDTH: <b>{}</b> байт".format(b_used),
-        "• Если ресурсов недостаточно, сгорит: <b>{:.6f} TRX</b>".format(cost_trx),
+    notes = plan.get("notes", [])
+    cur = plan.get("current", {})
+    miss = plan.get("missing", {})
+    req = plan.get("required", {})
+    pl = plan.get("plan", {})
+    activation = "да" if plan.get("activation_needed") else "нет"
+    activation_method = plan.get("activation_method") or "—"
+    text_lines = [
+        "Предпросмотр (без действий):",
+        f"Адрес: <code>{html.escape(addr)}</code>",
+        f"Аккаунт существует: {'да' if plan.get('exists') else 'нет'}",
+        f"Требуется активация: {activation} (метод: {activation_method})",
+        "\nРесурсы:",
+        f"Energy: {cur.get('energy',0)} / нужно {req.get('energy',0)} (не хватает {miss.get('energy',0)})",
+        f"Bandwidth: {cur.get('bandwidth',0)} / нужно {req.get('bandwidth',0)} (не хватает {miss.get('bandwidth',0)})",
+        "\nПлан делегации (TRX):",
+        f"Energy TRX: {pl.get('energy_trx',0)} | Bandwidth TRX: {pl.get('bandwidth_trx',0)}",
+        f"Safety x{pl.get('safety_multiplier')} | Оценка tx: {pl.get('tx_budget_estimate')}",
     ]
-    if e_fee and b_fee:
-        lines.append(f"• Текущие burn fees: ENERGY={e_fee} SUN, BANDWIDTH={b_fee} SUN/байт")
+    if notes:
+        text_lines.append("\nЗаметки: " + ", ".join(notes))
+    text_lines.append("\nПродолжить и выполнить делегацию? (да/нет)")
+    await state.update_data(free_gas_address=addr)
+    await message.answer("\n".join(text_lines), parse_mode="HTML")
+    await state.set_state(FreeGasFSM.confirm_topup)
+
+
+async def process_free_gas_confirm(message: types.Message, state: FSMContext):
+    choice = (message.text or "").strip().lower()
+    data = await state.get_data()
+    addr = data.get("free_gas_address")
+    if not addr:
+        await message.answer("Контекст утерян. Начните заново /free_gas")
+        await state.clear()
+        return
+    if choice in {"нет", "no", "n", "/cancel", "cancel", "отмена"}:
+        await message.answer("Отменено.")
+        await state.clear()
+        return
+    if choice not in {"да", "yes", "y"}:
+        await message.answer("Ответьте 'да' или 'нет'.")
+        return
+    # Perform actual preparation
+    try:
+        ok = prepare_for_sweep(addr)
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"prepare_for_sweep failed for {addr}: {e}")
+        ok = False
+    if ok:
+        try:
+            # Record usage best-effort
+            db = _get_bot_db(message)
+            record_free_gas_address(db, message.from_user.id, addr)
+        except Exception:  # noqa: BLE001
+            pass
+        await message.answer("✅ Адрес активирован и ресурсы делегированы (или уже были достаточны).")
+    else:
+        await message.answer("❌ Не удалось выполнить операцию. Попробуйте позже.")
+    await state.clear()
+
+
+async def handle_dry_free_gas(message: types.Message):
+    """Show only the simulation (dry-run) of a Free Gas operation without changing state."""
+    text = message.text or ""
+    parts = text.split()
+    if len(parts) == 1:
+        await message.answer("Использование: /dryfreegas <TRON адрес>\nПример: /dryfreegas TXXXX...")
+        return
+    addr = parts[1].strip()
+    if not _is_valid_tron_address(addr):
+        await message.answer("Некорректный TRON адрес. Проверьте формат.")
+        return
+    try:
+        try:
+            from core.services.gas_station import gas_station as _gs
+        except ImportError:  # pragma: no cover
+            from src.core.services.gas_station import gas_station as _gs  # type: ignore
+        plan = _gs.dry_run_prepare_for_sweep(addr)
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"dry_free_gas simulation failed: {e}")
+        await message.answer("Ошибка симуляции.")
+        return
+    if plan.get("error"):
+        await message.answer(f"Ошибка: {html.escape(plan['error'])}")
+        return
+    cur = plan.get("current", {})
+    miss = plan.get("missing", {})
+    req = plan.get("required", {})
+    pl = plan.get("plan", {})
+    activation = "да" if plan.get("activation_needed") else "нет"
+    activation_method = plan.get("activation_method") or "—"
+    lines = [
+        "Dry-run Free Gas:",
+        f"Адрес: <code>{html.escape(addr)}</code>",
+        f"Существует: {'да' if plan.get('exists') else 'нет'} | Активация: {activation} ({activation_method})",
+        f"Energy: {cur.get('energy',0)} / {req.get('energy',0)} (недостает {miss.get('energy',0)})",
+        f"Bandwidth: {cur.get('bandwidth',0)} / {req.get('bandwidth',0)} (недостает {miss.get('bandwidth',0)})",
+        f"TRX план: Energy {pl.get('energy_trx',0)} | Bandwidth {pl.get('bandwidth_trx',0)} | Safety x{pl.get('safety_multiplier')}",
+    ]
+    notes = plan.get("notes", [])
+    if notes:
+        lines.append("Заметки: " + ", ".join(notes))
     await message.answer("\n".join(lines), parse_mode="HTML")
+

@@ -167,6 +167,16 @@ async def main():
     log_and_handle(seller_handlers.handle_free_gas, "FreeGas"),
     lambda m: m.text in {"FreeGas", "Free Gas", "⛽️ Free Gas ⛽️", "/freegas", "/freeGas"},
     )
+    # Free Gas dry-run
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_dry_free_gas, "/dryfreegas"),
+        lambda m: m.text == "/dryfreegas",
+    )
+    # Alias with underscore
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_dry_free_gas, "/dry_free_gas"),
+        lambda m: m.text == "/dry_free_gas",
+    )
     
     logger.info("Starting Telegram bot...")
 

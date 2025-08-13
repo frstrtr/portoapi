@@ -263,4 +263,3 @@ out/
 target/
 .env.backup*
 tests/*.json
-tests/test_gas_station_core.py

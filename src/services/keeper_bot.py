@@ -394,6 +394,10 @@ class KeeperBot:
     
     def _get_hot_wallet_address(self) -> str:
         """Resolve the gas station hot wallet address from config"""
+        # Prefer explicit address for ownerless mode
+        addr_only = getattr(self.tron_config, "gas_wallet_address", "") or ""
+        if addr_only:
+            return addr_only
         if self.tron_config.gas_wallet_private_key:
             try:
                 pk = PrivateKey(bytes.fromhex(self.tron_config.gas_wallet_private_key))
@@ -408,7 +412,9 @@ class KeeperBot:
                 return node.PublicKey().ToAddress()
             except Exception as e:
                 logger.error("Failed to derive hot wallet address from mnemonic: %s", e)
-        raise ValueError("No valid gas wallet credentials configured")
+        # Ownerless without GAS_WALLET_ADDRESS – warn and return empty; caller will skip forwarding
+        logger.warning("No gas wallet credentials or GAS_WALLET_ADDRESS configured; running in restricted mode (no TRX forwarding)")
+        return ""
 
     def _derive_privkey_hex_from_path(self, derivation_path: str) -> str:
         """Derive a private key (hex) for a BIP44 derivation path using master mnemonic"""
@@ -429,10 +435,10 @@ class KeeperBot:
         - min_threshold_sun: skip forwarding if balance <= reserve + threshold
         Also credits the seller's gas_deposit_balance with the forwarded amount.
         """
-        try:
-            hot_wallet = self._get_hot_wallet_address()
-        except Exception as e:
-            logger.error("Cannot resolve hot wallet: %s", e)
+        hot_wallet = self._get_hot_wallet_address()
+        if not hot_wallet:
+            # Ownerless without destination address: skip forwarding but do not treat as error
+            logger.warning("Skipping TRX forwarding: hot wallet address not set (ownerless mode without GAS_WALLET_ADDRESS)")
             return
 
         try:

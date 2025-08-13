@@ -12,11 +12,14 @@ load_dotenv()
 
 class TronConfig:
     """Configuration for TRON blockchain interaction"""
-    
+
     def __init__(self):
         # Network Configuration
         self.network = os.getenv("TRON_NETWORK", "testnet")  # mainnet or testnet
         self.api_key = os.getenv("TRON_API_KEY", "")
+        # When true, never use remote endpoints; only the local node is allowed.
+        # Remote fallbacks in code will be disabled.
+        self.local_only = os.getenv("TRON_LOCAL_ONLY", "false").lower() == "true"
 
         # Local node configuration (preferred if available)
         self.local_node_enabled = os.getenv("TRON_LOCAL_NODE_ENABLED", "true").lower() == "true"
@@ -51,6 +54,24 @@ class TronConfig:
         # Single wallet gas station
         self.gas_wallet_private_key = os.getenv("GAS_WALLET_PRIVATE_KEY", "")
         self.gas_wallet_mnemonic = os.getenv("GAS_WALLET_MNEMONIC", "")
+        # Optional: address-only mode for production (no private keys on server)
+        self.gas_wallet_address = os.getenv("GAS_WALLET_ADDRESS", "")
+
+        # Optional control wallet (limited-permission signer for delegations)
+        # Intended for TRON account-permission setups where a separate key can only
+        # sign specific contracts (e.g., Freeze/Delegate), not TRX transfers.
+        self.gas_wallet_control_private_key = os.getenv("GAS_WALLET_CONTROL_PRIVATE_KEY", "")
+        self.gas_wallet_control_mnemonic = os.getenv("GAS_WALLET_CONTROL_MNEMONIC", "")
+        self.gas_wallet_control_path = os.getenv("GAS_WALLET_CONTROL_PATH", "")
+        # If true, when control signer fails due to permission issues, we may fall back to owner signer for delegation.
+        # Set to false to enforce strict separation (no fallback).
+        self.gas_control_fallback_to_owner = os.getenv("GAS_CONTROL_FALLBACK_TO_OWNER", "true").lower() == "true"
+        # Active permission id to use when signing with control wallet (TRON account permissions).
+        # Typically 2 for the first active permission.
+        try:
+            self.gas_wallet_control_permission_id = int(os.getenv("GAS_WALLET_CONTROL_PERMISSION_ID", "2"))
+        except ValueError:
+            self.gas_wallet_control_permission_id = 2
 
         # Multisig gas station
         self.multisig_contract_address = os.getenv("MULTISIG_CONTRACT_ADDRESS", "")
@@ -91,10 +112,10 @@ class TronConfig:
         # Safety caps per invoice so we don't drain gas wallet on a single address (bumped for higher targets)
         self.max_energy_delegation_trx_per_invoice = float(os.getenv("MAX_ENERGY_DELEGATION_TRX_PER_INVOICE", "300.0"))
         self.max_bandwidth_delegation_trx_per_invoice = float(os.getenv("MAX_BANDWIDTH_DELEGATION_TRX_PER_INVOICE", "5.0"))
-
         # Delegation behavior tuning
         # Small safety multiplier to overshoot targets and avoid landing just below thresholds
-        self.delegation_safety_multiplier = float(os.getenv("DELEGATION_SAFETY_MULTIPLIER", "1.1"))
+        # Reduced from 1.10 to 1.05 to limit overshoot while still avoiding under-shoot edge cases
+        self.delegation_safety_multiplier = float(os.getenv("DELEGATION_SAFETY_MULTIPLIER", "1.05"))
         # Network minimum for delegate_resource is 1 TRX; allow override but clamp to >= 1.0 in code
         self.min_delegate_trx = float(os.getenv("MIN_DELEGATE_TRX", "1.0"))
 
@@ -104,24 +125,30 @@ class TronConfig:
             logger.warning("Invalid GAS_ACCOUNT_ACTIVATION_MODE=%s, falling back to 'transfer'", self.account_activation_mode)
             self.account_activation_mode = "transfer"
 
+        # Optional separate activation wallet (used only to send tiny TRX to activate new addresses)
+        # This allows running without granting 'Transfer TRX' to the control signer.
+        self.activation_wallet_private_key = os.getenv("ACTIVATION_WALLET_PRIVATE_KEY", "")
+        self.activation_wallet_address = os.getenv("ACTIVATION_WALLET_ADDRESS", "")
+
         # Validation
         self._validate_config()
-    
+
     def _parse_multisig_keys(self) -> list:
         """Parse multisig owner private keys from environment"""
         keys_str = os.getenv("MULTISIG_OWNER_KEYS", "")
         if not keys_str:
             return []
         return [key.strip() for key in keys_str.split(",") if key.strip()]
-    
+
     def _validate_config(self):
         """Validate configuration settings"""
         if self.network not in ["mainnet", "testnet"]:
             raise ValueError(f"Invalid TRON_NETWORK: {self.network}. Must be 'mainnet' or 'testnet'")
-        
+
         if self.gas_station_type == "single":
-            if not self.gas_wallet_private_key and not self.gas_wallet_mnemonic:
-                logger.warning("No gas wallet credentials provided for single wallet mode")
+            # Accept either credentials (private key/mnemonic) or address-only mode
+            if not (self.gas_wallet_private_key or self.gas_wallet_mnemonic or self.gas_wallet_address):
+                logger.warning("No gas wallet credentials or address provided for single wallet mode")
         elif self.gas_station_type == "multisig":
             if not self.multisig_contract_address:
                 raise ValueError("MULTISIG_CONTRACT_ADDRESS required for multisig mode")
@@ -129,7 +156,7 @@ class TronConfig:
                 raise ValueError(f"Not enough multisig owner keys. Required: {self.multisig_required_signatures}, Provided: {len(self.multisig_owner_keys)}")
         else:
             raise ValueError(f"Invalid GAS_STATION_TYPE: {self.gas_station_type}. Must be 'single' or 'multisig'")
-    
+
     def get_tron_client_config(self) -> dict:
         """Get configuration for TronPy client, preferring local node if available"""
         if self.local_node_enabled:
@@ -137,45 +164,56 @@ class TronConfig:
                 "full_node": self.local_full_node,
                 "solidity_node": self.local_solidity_node,
                 "event_server": self.local_event_server,
-                "node_type": "local"
+                "node_type": "local",
             }
         else:
             client_config = {
                 "full_node": self.remote_full_node,
                 "solidity_node": self.remote_solidity_node,
                 "event_server": self.remote_event_server,
-                "node_type": "remote"
+                "node_type": "remote",
             }
-        
+        # If local-only, explicitly mark for consumers
+        if self.local_only:
+            client_config["local_only"] = True
+
         # Add API key for remote connections
         if not self.local_node_enabled and self.api_key:
             client_config["api_key"] = self.api_key
-            
+
         return client_config
-    
+
     def test_local_node_connection(self) -> bool:
         """Test if local TRON node is accessible"""
         if not self.local_node_enabled:
             return False
-            
+
         try:
             response = requests.get(f"{self.local_full_node}/wallet/getnowblock", timeout=5)
             return response.status_code == 200
         except requests.RequestException:
             return False
-    
+
     def get_fallback_client_config(self) -> dict:
         """Get fallback configuration when local node fails"""
+        # In local-only mode, do not provide remote fallback configuration
+        if self.local_only:
+            return {
+                "full_node": self.local_full_node,
+                "solidity_node": self.local_solidity_node,
+                "event_server": self.local_event_server,
+                "node_type": "local",
+            }
         client_config = {
             "full_node": self.remote_full_node,
             "solidity_node": self.remote_solidity_node,
             "event_server": self.remote_event_server,
-            "node_type": "remote_fallback"
+            "node_type": "remote_fallback",
         }
-        
+
         if self.api_key:
             client_config["api_key"] = self.api_key
-            
+
         return client_config
 
 class DatabaseConfig:

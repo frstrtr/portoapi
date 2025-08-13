@@ -114,6 +114,12 @@ run_all() {
   local WANT_NGROK="${1:-auto}" # auto|force|off
   echo "[run] launching components"
 
+  # Preflight: warn if another bot instance appears to be running (prevents TelegramConflictError)
+  if ps aux | grep -E "python .*src/bot/main_bot.py" | grep -v grep >/dev/null; then
+    echo "[warn] Another Telegram bot instance seems to be running. This can cause 'terminated by other getUpdates request'."
+    echo "[hint] Run: scripts/stop_all.sh to terminate previous processes, then re-run this script."
+  fi
+
   # Start API
   start_api 2>&1 | tee logs/api.log &
   API_PID=$!

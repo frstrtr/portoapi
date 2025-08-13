@@ -177,6 +177,53 @@ MIN_DELEGATE_TRX=1.0
 GAS_ACCOUNT_ACTIVATION_MODE=transfer
 ```
 
+#### Control Signer for Delegations (Advanced, Safer)
+
+To prevent your main gas wallet from being able to move TRX during routine operations, configure a separate control key that can only delegate resources. TRX transfers (activation) will continue to use the main key.
+
+```env
+# Control signer (choose either raw key or mnemonic+path)
+GAS_WALLET_CONTROL_PRIVATE_KEY=hex-privkey
+# or
+GAS_WALLET_CONTROL_MNEMONIC="seed words..."
+GAS_WALLET_CONTROL_PATH="m/44'/195'/1'/0/0"
+
+# TRON account-permission id (Active Permission) bound to the control key
+GAS_WALLET_CONTROL_PERMISSION_ID=2
+
+# Allow fallback to owner signer for delegations if control signer fails (set false for strict separation)
+GAS_CONTROL_FALLBACK_TO_OWNER=true
+```
+
+Steps to configure on TRON account:
+
+1. Create an Active Permission and add the control public key to it.
+2. Restrict allowed operations to freezing/delegation with receiver where possible.
+3. Note the permission id and set `GAS_WALLET_CONTROL_PERMISSION_ID` in your `.env`.
+
+Behavior:
+
+- Delegations (ENERGY/BANDWIDTH) are signed with the control key using the given permission id.
+- If fallback is disabled and control signing fails, delegations are skipped.
+- If fallback is enabled, the system falls back to the owner signer for resilience (less strict).
+
+#### Configuration Warnings and Health
+
+On startup, the service evaluates your environment and emits warnings when activation mode and signer configuration may cause failures. You can see them in:
+
+- Telegram command: /gasstation — a "Configuration warnings" section is appended.
+- API: GET /v1/gasstation/status returns a warnings array and node info.
+
+Common warnings and their fixes:
+
+- "Ownerless mode without control signer": Either set GAS_WALLET_CONTROL_PRIVATE_KEY (with limited permissions) or provide owner keys.
+- "Activation mode=transfer: no owner key, no ACTIVATION_WALLET_PRIVATE_KEY, no control signer": Provide any one of these, or activation will fail.
+- "Activation mode=transfer with ownerless control": Control signer must include the "Transfer TRX" operation or set ACTIVATION_WALLET_PRIVATE_KEY for activation transfers.
+- "Activation mode=create_account: neither owner nor control signer": Add at least one signer capable of activation.
+- "create_account not supported by client": Your tronpy/client lacks create_account builder. Either allow Transfer TRX on control or set ACTIVATION_WALLET_PRIVATE_KEY, or switch GAS_ACCOUNT_ACTIVATION_MODE=transfer.
+
+Tip: You can keep your server ownerless by disabling Transfer TRX on the control signer and providing a small ACTIVATION_WALLET_PRIVATE_KEY that only funds new accounts with tiny TRX.
+
 #### Multisig Mode (Advanced)
 
 ```env
