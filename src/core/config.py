@@ -17,14 +17,10 @@ class TronConfig:
         # Network Configuration
         self.network = os.getenv("TRON_NETWORK", "testnet")  # mainnet or testnet
         self.api_key = os.getenv("TRON_API_KEY", "")
-        # When true, never use remote endpoints; only the local node is allowed.
-        # Remote fallbacks in code will be disabled.
         self.local_only = os.getenv("TRON_LOCAL_ONLY", "false").lower() == "true"
-
-        # Local node configuration (preferred if available)
         self.local_node_enabled = os.getenv("TRON_LOCAL_NODE_ENABLED", "true").lower() == "true"
 
-        # Network-specific local nodes
+        # Local node configuration
         if self.network == "mainnet":
             self.local_full_node = os.getenv("TRON_MAINNET_LOCAL_FULL_NODE", "http://192.168.86.20:8090")
             self.local_solidity_node = os.getenv("TRON_MAINNET_LOCAL_SOLIDITY_NODE", "http://192.168.86.20:8091")
@@ -42,95 +38,89 @@ class TronConfig:
             self.remote_solidity_node = os.getenv("TRON_REMOTE_MAINNET_SOLIDITY_NODE", "https://api.trongrid.io")
             self.remote_event_server = os.getenv("TRON_REMOTE_MAINNET_EVENT_SERVER", "https://api.trongrid.io")
             self.usdt_contract = os.getenv("TRON_MAINNET_USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")
-        else:  # testnet
+        else:
             self.remote_full_node = os.getenv("TRON_REMOTE_TESTNET_FULL_NODE", "https://nile.trongrid.io")
             self.remote_solidity_node = os.getenv("TRON_REMOTE_TESTNET_SOLIDITY_NODE", "https://nile.trongrid.io")
             self.remote_event_server = os.getenv("TRON_REMOTE_TESTNET_EVENT_SERVER", "https://nile.trongrid.io")
             self.usdt_contract = os.getenv("TRON_TESTNET_USDT_CONTRACT", "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf")
 
         # Gas Station Configuration
-        self.gas_station_type = os.getenv("GAS_STATION_TYPE", "single")  # single or multisig
-
-        # Single wallet gas station
+        self.gas_station_type = os.getenv("GAS_STATION_TYPE", "single")
         self.gas_wallet_private_key = os.getenv("GAS_WALLET_PRIVATE_KEY", "")
         self.gas_wallet_mnemonic = os.getenv("GAS_WALLET_MNEMONIC", "")
-        # Optional: address-only mode for production (no private keys on server)
         self.gas_wallet_address = os.getenv("GAS_WALLET_ADDRESS", "")
+        self.gas_wallet_xpub = os.getenv("GAS_WALLET_XPUB", "")
+        # Sweeping (forwarding) enable flag. If a global xpub is present we force-disable
+        # local sweeping for security (must be done on isolated server with keys).
+        self.sweep_enabled = os.getenv("SWEEP_ENABLED", "true").lower() == "true"
+        if self.gas_wallet_xpub:
+            # Force off regardless of env when running in xpub-only/ownerless mode.
+            self.sweep_enabled = False
 
-        # Optional control wallet (limited-permission signer for delegations)
-        # Intended for TRON account-permission setups where a separate key can only
-        # sign specific contracts (e.g., Freeze/Delegate), not TRX transfers.
+        # Control signer (optional limited permission key)
         self.gas_wallet_control_private_key = os.getenv("GAS_WALLET_CONTROL_PRIVATE_KEY", "")
         self.gas_wallet_control_mnemonic = os.getenv("GAS_WALLET_CONTROL_MNEMONIC", "")
         self.gas_wallet_control_path = os.getenv("GAS_WALLET_CONTROL_PATH", "")
-        # If true, when control signer fails due to permission issues, we may fall back to owner signer for delegation.
-        # Set to false to enforce strict separation (no fallback).
         self.gas_control_fallback_to_owner = os.getenv("GAS_CONTROL_FALLBACK_TO_OWNER", "true").lower() == "true"
-        # Active permission id to use when signing with control wallet (TRON account permissions).
-        # Typically 2 for the first active permission.
         try:
             self.gas_wallet_control_permission_id = int(os.getenv("GAS_WALLET_CONTROL_PERMISSION_ID", "2"))
         except ValueError:
             self.gas_wallet_control_permission_id = 2
 
-        # Multisig gas station
+        # Multisig (optional alternative mode)
         self.multisig_contract_address = os.getenv("MULTISIG_CONTRACT_ADDRESS", "")
         self.multisig_required_signatures = int(os.getenv("MULTISIG_REQUIRED_SIGNATURES", "2"))
         self.multisig_owner_keys = self._parse_multisig_keys()
 
-        # Resource delegation settings (network-specific)
+        # Delegation settings
         if self.network == "testnet":
-            # Testnet defaults tuned to reach TRC20 transfer energy in a few steps
             self.auto_activation_amount = float(os.getenv("AUTO_ACTIVATION_TRX_AMOUNT", "1.0"))
-            # Bump energy delegation step for faster convergence
             self.energy_delegation_amount = float(os.getenv("ENERGY_DELEGATION_TRX_AMOUNT", "20.0"))
             self.bandwidth_delegation_amount = float(os.getenv("BANDWIDTH_DELEGATION_TRX_AMOUNT", "1.0"))
         else:
-            # Mainnet defaults (conservative but sufficient)
             self.auto_activation_amount = float(os.getenv("AUTO_ACTIVATION_TRX_AMOUNT", "1.5"))
-            # Bump energy delegation step for faster convergence
             self.energy_delegation_amount = float(os.getenv("ENERGY_DELEGATION_TRX_AMOUNT", "20.0"))
             self.bandwidth_delegation_amount = float(os.getenv("BANDWIDTH_DELEGATION_TRX_AMOUNT", "2.0"))
 
-        # Target resource thresholds to enable USDT transfer reliably
-        # Energy target bumped to cover up to ~4 TRC20 transfers per address with headroom
         self.target_energy_units = int(os.getenv("TARGET_ENERGY_UNITS", "90000"))
-        # Bandwidth target; fresh activation grants ~600 free bandwidth, add headroom
         self.target_bandwidth_units = int(os.getenv("TARGET_BANDWIDTH_UNITS", "1000"))
-
-        # Heuristic conversion estimates (units per 1 TRX staked); tune per network
-        # Default: 300 energy units per 1 TRX (adjust via env if needed)
         self.energy_units_per_trx_estimate = int(os.getenv("ENERGY_UNITS_PER_TRX_ESTIMATE", "300"))
         self.bandwidth_units_per_trx_estimate = int(os.getenv("BANDWIDTH_UNITS_PER_TRX_ESTIMATE", "1500"))
-
-        # Per-transfer resource estimates for TRC20 USDT transfer (used to top-up only as needed)
-        # Defaults tuned for Nile testnet as observed via Tronscan API: ~14,650 energy and ~345 bandwidth
-        # Override via env if your network requires different amounts or for mainnet tuning
+        # Planning floor: assume at most this many BANDWIDTH units generated per 1 TRX when computing required stake
+        # (smaller number => larger planned stake). Helps when delegate_resource under-delivers relative to optimistic estimate.
+        try:
+            self.bandwidth_yield_floor_units = int(os.getenv("BANDWIDTH_YIELD_FLOOR_UNITS", "150"))
+        except ValueError:
+            self.bandwidth_yield_floor_units = 150
+        # If owner already has at least this many TRX staked toward BANDWIDTH, skip additional freeze and try pure delegation first
+        try:
+            self.bandwidth_freeze_skip_threshold_trx = float(os.getenv("BANDWIDTH_FREEZE_SKIP_THRESHOLD_TRX", "10.0"))
+        except ValueError:
+            self.bandwidth_freeze_skip_threshold_trx = 10.0
+        # Force 1:1 TRX stake per missing BANDWIDTH unit (ignores yield estimates); default enabled
+        self.bandwidth_force_1to1 = os.getenv("BANDWIDTH_FORCE_1TO1", "true").lower() == "true"
+        # When force 1:1, include safety multiplier (true) or use exact missing amount (false)
+        self.bandwidth_1to1_include_safety = os.getenv("BANDWIDTH_1TO1_INCLUDE_SAFETY", "true").lower() == "true"
+        # Optional hard cap override (TRX) for 1:1 bandwidth delegation. If 0 -> ignore existing per-invoice cap.
+        try:
+            self.bandwidth_1to1_cap_override_trx = float(os.getenv("BANDWIDTH_1TO1_CAP_OVERRIDE_TRX", "0"))
+        except ValueError:
+            self.bandwidth_1to1_cap_override_trx = 0.0
         self.usdt_energy_per_transfer_estimate = int(os.getenv("USDT_ENERGY_PER_TRANSFER_ESTIMATE", "14650"))
         self.usdt_bandwidth_per_transfer_estimate = int(os.getenv("USDT_BANDWIDTH_PER_TRANSFER_ESTIMATE", "345"))
-
-        # Safety caps per invoice so we don't drain gas wallet on a single address (bumped for higher targets)
         self.max_energy_delegation_trx_per_invoice = float(os.getenv("MAX_ENERGY_DELEGATION_TRX_PER_INVOICE", "300.0"))
         self.max_bandwidth_delegation_trx_per_invoice = float(os.getenv("MAX_BANDWIDTH_DELEGATION_TRX_PER_INVOICE", "5.0"))
-        # Delegation behavior tuning
-        # Small safety multiplier to overshoot targets and avoid landing just below thresholds
-        # Reduced from 1.10 to 1.05 to limit overshoot while still avoiding under-shoot edge cases
         self.delegation_safety_multiplier = float(os.getenv("DELEGATION_SAFETY_MULTIPLIER", "1.05"))
-        # Network minimum for delegate_resource is 1 TRX; allow override but clamp to >= 1.0 in code
         self.min_delegate_trx = float(os.getenv("MIN_DELEGATE_TRX", "1.0"))
 
-        # Account activation mode: 'transfer' (send TRX) or 'create_account' (no TRX transfer)
         self.account_activation_mode = os.getenv("GAS_ACCOUNT_ACTIVATION_MODE", "transfer").lower()
         if self.account_activation_mode not in {"transfer", "create_account"}:
             logger.warning("Invalid GAS_ACCOUNT_ACTIVATION_MODE=%s, falling back to 'transfer'", self.account_activation_mode)
             self.account_activation_mode = "transfer"
 
-        # Optional separate activation wallet (used only to send tiny TRX to activate new addresses)
-        # This allows running without granting 'Transfer TRX' to the control signer.
         self.activation_wallet_private_key = os.getenv("ACTIVATION_WALLET_PRIVATE_KEY", "")
         self.activation_wallet_address = os.getenv("ACTIVATION_WALLET_ADDRESS", "")
 
-        # Validation
         self._validate_config()
 
     def _parse_multisig_keys(self) -> list:

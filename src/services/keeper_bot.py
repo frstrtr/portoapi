@@ -19,9 +19,9 @@ from dataclasses import dataclass
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, project_root)
 
-from src.core.database.db_service import get_db, get_invoices_by_seller, get_invoice, update_invoice, create_transaction, get_seller, update_seller, get_transactions_by_invoice
+from src.core.database.db_service import get_db, get_invoices_by_seller, get_invoice, update_invoice, create_transaction, get_seller, update_seller
 from src.core.database.models import Invoice, Wallet
-from src.core.services.gas_station import auto_activate_on_usdt_receive
+from src.core.services.gas_station import auto_activate_on_usdt_receive, GasStationManager
 from src.core.config import config
 from bip_utils import Bip44, Bip44Coins, Bip44Changes, Bip39SeedGenerator
 import importlib as _importlib
@@ -235,7 +235,7 @@ class KeeperBot:
     def notify_invoice_paid(self, invoice_id: int, tx_hash: str, amount: float):
         """Notify about paid invoice"""
         logger.info("Invoice %s paid: tx=%s, amount=%s", invoice_id, tx_hash, amount)
-        # TODO: реализовать отправку уведомления (например, через Redis или очередь)
+    # Notification hook placeholder
     
     def handle_invoice_payment(self, db, contract, inv, address: str, not_activated: bool):
         """Handle payment for an invoice using a simple balance snapshot.
@@ -435,10 +435,16 @@ class KeeperBot:
         - min_threshold_sun: skip forwarding if balance <= reserve + threshold
         Also credits the seller's gas_deposit_balance with the forwarded amount.
         """
+        if not getattr(self.tron_config, 'sweep_enabled', True):
+            logger.debug("Skipping TRX forwarding (sweep disabled or xpub-only mode)")
+            return
         hot_wallet = self._get_hot_wallet_address()
         if not hot_wallet:
             # Ownerless without destination address: skip forwarding but do not treat as error
             logger.warning("Skipping TRX forwarding: hot wallet address not set (ownerless mode without GAS_WALLET_ADDRESS)")
+            return
+        if not self.tron_config.gas_wallet_mnemonic:
+            logger.debug("Skipping TRX forwarding: mnemonic not available (ownerless or control-only mode)")
             return
 
         try:
@@ -463,16 +469,7 @@ class KeeperBot:
                             continue
                         priv_hex = self._derive_privkey_hex_from_path(w.derivation_path)
                         pk_obj = PrivateKey(bytes.fromhex(priv_hex))
-                        # Build and send transfer
-                        txn = (
-                            self.client.trx.transfer(
-                                addr,
-                                hot_wallet,
-                                amount_sun
-                            )
-                            .build()
-                            .sign(pk_obj)
-                        )
+                        txn = self.client.trx.transfer(addr, hot_wallet, amount_sun).build().sign(pk_obj)
                         res = txn.broadcast()
                         txid = res.get('txid') if isinstance(res, dict) else None
                         amount_trx = amount_sun / 1_000_000
@@ -487,7 +484,7 @@ class KeeperBot:
                             )
                         except Exception as ce:
                             logger.error("Failed to credit seller %s: %s", w.seller_id, ce)
-                        logger.info("Forwarded %.2f TRX from %s -> %s (tx: %s)", amount_trx, addr, hot_wallet, txid)
+                        logger.info("Forwarded %.2f TRX from %s -> %s (tx=%s)", amount_trx, addr, hot_wallet, txid)
                     except Exception as e:
                         logger.error("Failed to forward TRX from %s: %s", addr, e)
                         continue

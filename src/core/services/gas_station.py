@@ -314,6 +314,35 @@ class GasStationManager:
             pass
         return txn
 
+    def _pre_sign_embed_permission(self, txn, permission_id: int | None):
+        """Embed permission id into transaction BEFORE signing.
+        Modifies both raw_data (so it's covered by the signature) and the top-level helper
+        attributes some providers inspect. Safe only pre-sign. Returns txn (possibly unchanged)."""
+        if permission_id is None:
+            return txn
+        try:
+            pid = int(permission_id)
+        except Exception:
+            return txn
+        try:
+            if hasattr(txn, "raw_data") and isinstance(txn.raw_data, dict):
+                txn.raw_data["permission_id"] = pid
+            # Also set convenience attributes (non-critical if fail)
+            try:
+                setattr(txn, "permission_id", pid)
+            except Exception:
+                pass
+            try:
+                tx_dict = getattr(txn, "tx", None)
+                if isinstance(tx_dict, dict):
+                    tx_dict["permission_id"] = pid
+                    tx_dict["Permission_id"] = pid
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return txn
+
     def _manual_sign_and_broadcast(self, txn_obj, pk: PrivateKey, permission_id: int | None = None) -> str | None:
         """Manually sign a built transaction bypassing tronpy's permission checks and broadcast it.
         - Computes signature over txID (sha256 of raw_data)
@@ -563,6 +592,47 @@ class GasStationManager:
         tx, _ = self._http_local_remote("POST", "/wallet/delegateresource", payload=payload, timeout=10)
         if not tx:
             return None
+        return self._sign_and_broadcast_node_tx(tx, signer_pk, permission_id)
+
+    def _http_freeze_delegate_resource(self, owner_addr: str, receiver_addr: str, amount_sun: int, resource: str, signer_pk: PrivateKey, permission_id: int | None) -> str | None:
+        """Freeze (stake) TRX to delegate resources via node-built transaction including Permission_id.
+        Tries freezebalancev2 first (modern), then legacy freezebalance. Returns txid or None."""
+        # Build payload for v2
+        payload_v2 = {
+            "owner_address": owner_addr,
+            "receiver_address": receiver_addr,
+            "resource": resource.upper(),
+            "freeze_balance": int(amount_sun),
+            "visible": True,
+        }
+        if permission_id is not None:
+            try:
+                pid = int(permission_id)
+                payload_v2["permission_id"] = pid
+                payload_v2["Permission_id"] = pid
+            except Exception:
+                pass
+        tx, _ = self._http_local_remote("POST", "/wallet/freezebalancev2", payload=payload_v2, timeout=10)
+        if not tx or not isinstance(tx, dict) or not tx.get("txID"):
+            # Fallback legacy endpoint
+            payload_legacy = {
+                "owner_address": owner_addr,
+                "receiver_address": receiver_addr,
+                "resource": resource.upper(),
+                "frozen_balance": int(amount_sun),
+                "frozen_duration": 3,
+                "visible": True,
+            }
+            if permission_id is not None:
+                try:
+                    pid = int(permission_id)
+                    payload_legacy["permission_id"] = pid
+                    payload_legacy["Permission_id"] = pid
+                except Exception:
+                    pass
+            tx, _ = self._http_local_remote("POST", "/wallet/freezebalance", payload=payload_legacy, timeout=10)
+            if not tx or not isinstance(tx, dict) or not tx.get("txID"):
+                return None
         return self._sign_and_broadcast_node_tx(tx, signer_pk, permission_id)
 
     def _http_undelegate_resource(self, owner_addr: str, receiver_addr: str, amount_sun: int, resource: str, signer_pk: PrivateKey, permission_id: int | None) -> str | None:
@@ -1464,8 +1534,8 @@ class GasStationManager:
                                     txn_forced = builder_forced.build()
                                     try:
                                         if perm_id is not None:
-                                            txn_forced = self._apply_permission_id(txn_forced, perm_id)
-                                            txn_forced = txn_forced.sign(activation_signer, permission_id=perm_id)
+                                            txn_forced = self._pre_sign_embed_permission(txn_forced, perm_id)
+                                            txn_forced = txn_forced.sign(activation_signer)
                                             txn_forced = self._apply_permission_id(txn_forced, perm_id)
                                         else:
                                             txn_forced = txn_forced.sign(activation_signer)
@@ -1506,14 +1576,13 @@ class GasStationManager:
                                 txn = builder.build()
                                 try:
                                     if signer_is_control and perm_id is not None:
-                                        txn = self._apply_permission_id(txn, perm_id)
+                                        txn = self._pre_sign_embed_permission(txn, perm_id)
                                         try:
                                             rid = getattr(txn, "raw_data", {}).get("permission_id")
                                             logger.info("[gas_station] create_account tx pre-sign permission_id=%s", rid)
                                         except Exception:
                                             pass
-                                        txn = txn.sign(activation_signer, permission_id=perm_id)
-                                        # Re-apply as some serializers may drop it on sign
+                                        txn = txn.sign(activation_signer)
                                         txn = self._apply_permission_id(txn, perm_id)
                                     else:
                                         txn = txn.sign(activation_signer)
@@ -1537,14 +1606,13 @@ class GasStationManager:
                                 txn = builder.build()
                                 try:
                                     if signer_is_control and perm_id is not None:
-                                        txn = self._apply_permission_id(txn, perm_id)
+                                        txn = self._pre_sign_embed_permission(txn, perm_id)
                                         try:
                                             rid = getattr(txn, "raw_data", {}).get("permission_id")
                                             logger.info("[gas_station] transfer tx pre-sign permission_id=%s", rid)
                                         except Exception:
                                             pass
-                                        txn = txn.sign(activation_signer, permission_id=perm_id)
-                                        # Re-apply after sign
+                                        txn = txn.sign(activation_signer)
                                         txn = self._apply_permission_id(txn, perm_id)
                                     else:
                                         txn = txn.sign(activation_signer)
@@ -1580,13 +1648,13 @@ class GasStationManager:
                                     txn_f = builder_f.build()
                                     try:
                                         if signer_is_control and perm_id is not None:
-                                            txn_f = self._apply_permission_id(txn_f, perm_id)
+                                            txn_f = self._pre_sign_embed_permission(txn_f, perm_id)
                                             try:
                                                 ridf = getattr(txn_f, "raw_data", {}).get("permission_id")
                                                 logger.info("[gas_station] transfer-fallback tx pre-sign permission_id=%s", ridf)
                                             except Exception:
                                                 pass
-                                            txn_f = txn_f.sign(activation_signer, permission_id=perm_id)
+                                            txn_f = txn_f.sign(activation_signer)
                                             txn_f = self._apply_permission_id(txn_f, perm_id)
                                         else:
                                             txn_f = txn_f.sign(activation_signer)
@@ -2367,14 +2435,13 @@ class GasStationManager:
         include_bandwidth: bool = True,
         tx_budget_remaining: int = 2,
     ) -> None:
-        """Single‑shot delegation calculation.
-        Computes missing ENERGY/BANDWIDTH once and performs at most one delegation
-        tx per resource (ENERGY first, then BANDWIDTH). Eliminates iterative
-        multi-step topping to reduce on-chain tx count.
+        """Compute and perform at most one ENERGY and one BANDWIDTH resource provisioning tx.
+        Improvements:
+          - BANDWIDTH: prefer freeze (stake) first; delegate_resource only moves already staked bandwidth.
+          - Yield floor upscale: if optimistic yield suggests <1 TRX but we have zero prior delegation effect, scale using floor.
         """
         if tx_budget_remaining <= 0:
             return
-        # Current resources
         res0 = self._get_account_resources(receiver_addr)
         cur_e = int(res0.get("energy_available", 0) or 0)
         cur_bw = int(res0.get("bandwidth_available", 0) or 0)
@@ -2382,19 +2449,26 @@ class GasStationManager:
         miss_bw = max(0, int(target_bandwidth_units or 0) - cur_bw)
         if miss_e <= 0 and miss_bw <= 0:
             return
-        # Yields (units per 1 TRX)
+        # If we need BANDWIDTH but owner has no staked bandwidth capacity (cannot freeze in ownerless mode), abort early with guidance.
+        owner_bw_trx = 0.0
+        if include_bandwidth and miss_bw > 0:
+            try:
+                owner_stake = self.get_owner_delegated_stake()
+                owner_bw_trx = float(owner_stake.get("bandwidth_trx", 0.0) or 0.0)
+                logger.info("[gas_station] Owner BANDWIDTH stake detected: %.3f TRX", owner_bw_trx)
+            except Exception:
+                owner_bw_trx = 0.0
         try:
             e_yield = float(max(1, int(self.tron_config.energy_units_per_trx_estimate)))
-        except Exception:  # noqa: BLE001
+        except Exception:
             e_yield = 300.0
         try:
             bw_yield = float(max(1, int(self._estimate_bandwidth_units_per_trx())))
-        except Exception:  # noqa: BLE001
+        except Exception:
             try:
                 bw_yield = float(max(1, int(self.tron_config.bandwidth_units_per_trx_estimate)))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 bw_yield = 1500.0
-        # Configured bounds
         safety_mult = float(getattr(self.tron_config, "delegation_safety_multiplier", 1.1) or 1.1)
         try:
             min_trx = max(1.0, float(getattr(self.tron_config, "min_delegate_trx", 1.0) or 1.0))
@@ -2403,25 +2477,79 @@ class GasStationManager:
         max_energy_cap = float(getattr(self.tron_config, "max_energy_delegation_trx_per_invoice", 0.0) or 0.0)
         max_bw_cap = float(getattr(self.tron_config, "max_bandwidth_delegation_trx_per_invoice", 0.0) or 0.0)
 
-        def _calc_trx(missing_units: int, per_trx_yield: float, cap: float) -> float:
-            if missing_units <= 0 or per_trx_yield <= 0:
+        def _calc(resource: str, missing_units: int, per_trx_yield: float, cap: float) -> float:
+            if missing_units <= 0:
                 return 0.0
-            raw = (missing_units / per_trx_yield) * safety_mult
+            per_y = max(1.0, per_trx_yield)
+            # Force 1:1 staking for BANDWIDTH if enabled (ignores yield assumptions)
+            if resource == "BANDWIDTH" and getattr(self.tron_config, "bandwidth_force_1to1", True):
+                include_safety = getattr(self.tron_config, "bandwidth_1to1_include_safety", True)
+                raw_direct = float(missing_units)
+                if include_safety:
+                    raw_direct *= safety_mult
+                amt = max(min_trx, raw_direct)
+                # Allow optional override cap; if override set (>0) it supersedes invoice cap logic; if 0 ignore both caps
+                override_cap = float(getattr(self.tron_config, "bandwidth_1to1_cap_override_trx", 0.0) or 0.0)
+                if override_cap > 0:
+                    amt = min(amt, override_cap)
+                # If override_cap is 0 we intentionally ignore per-invoice cap to ensure full coverage
+                elif cap > 0:
+                    amt = min(amt, cap)
+                logger.info(
+                    "[gas_station] BANDWIDTH 1:1 calc miss=%d%s -> %.6f TRX (min=%.3f override_cap=%.3f cap=%.3f)",
+                    missing_units,
+                    " * safety" if include_safety else "",
+                    amt,
+                    min_trx,
+                    override_cap,
+                    cap,
+                )
+                return round(amt, 6)
+            raw = (missing_units / per_y) * safety_mult
             amt = max(min_trx, raw)
             if cap > 0:
                 amt = min(amt, cap)
+            if resource == "BANDWIDTH" and amt == min_trx and missing_units > 0:
+                # Upscale using pessimistic floor yield
+                try:
+                    floor_y = float(max(1, int(getattr(self.tron_config, "bandwidth_yield_floor_units", 150))))
+                except Exception:
+                    floor_y = 150.0
+                # Prefer dynamic per-day yield from network if available (more conservative if smaller)
+                try:
+                    net_params = self.get_global_resource_parameters()
+                    dyn_bw = float(net_params.get("dailyBandwidthPerTrx", 0.0) or 0.0)
+                    if dyn_bw >= 1:
+                        per_y = min(per_y, dyn_bw)  # take the lower (more conservative)
+                except Exception:
+                    pass
+                required_by_floor = (missing_units / floor_y) * safety_mult if floor_y > 0 else 0.0
+                required_by_dyn = (missing_units / per_y) * safety_mult if per_y > 0 else 0.0
+                alt_amt = max(min_trx, required_by_floor, required_by_dyn)
+                if cap > 0:
+                    alt_amt = min(alt_amt, cap)
+                if alt_amt > amt:
+                    logger.info(
+                        "[gas_station] BANDWIDTH upscale calc miss=%d optimisticYield=%.1f dynOrUsed=%.1f floor=%.0f -> %.6f TRX (was %.6f)",
+                        missing_units,
+                        per_trx_yield,
+                        per_y,
+                        floor_y,
+                        alt_amt,
+                        amt,
+                    )
+                    amt = alt_amt
             return round(amt, 6)
 
-        # Determine required TRX amounts (single-shot) for each resource
-        energy_trx = _calc_trx(miss_e if include_energy else 0, e_yield, max_energy_cap)
-        bw_trx = _calc_trx(miss_bw if include_bandwidth else 0, bw_yield, max_bw_cap)
+        energy_trx = _calc("ENERGY", miss_e if include_energy else 0, e_yield, max_energy_cap)
+        bw_trx = _calc("BANDWIDTH", miss_bw if include_bandwidth else 0, bw_yield, max_bw_cap)
 
-        # Helper to perform delegation (reusing previous robust logic but without loop)
-        def _delegate(amount_trx: float, resource: str) -> None:
+        def _delegate(amount_trx: float, resource: str, expected_missing_units: int) -> None:
+            nonlocal tx_budget_remaining
             if amount_trx <= 0 or tx_budget_remaining <= 0:
                 return
             amt_sun = int(round(amount_trx * 1_000_000))
-            signer_addr = None
+            # Determine signer role/permission
             try:
                 signer_addr = signing_pk.public_key.to_base58check_address()
             except Exception:
@@ -2430,75 +2558,95 @@ class GasStationManager:
             perm_id = self._resolve_control_permission_id() if is_control else None
             pre_res = self._get_account_resources(receiver_addr)
             txid = None
-            if is_control and perm_id is not None:
-                txid = self._http_delegate_resource(owner_addr, receiver_addr, amt_sun, resource, signing_pk, perm_id)
-            if not txid:
-                # Fallback to tronpy delegate or freeze
-                try:
+            method_used = None
+            prefer_freeze_first = (resource.upper() == "BANDWIDTH")
+            # If using control signer (not owner) disable freeze attempt – delegate only
+            if is_control:
+                prefer_freeze_first = False
+            # If control signer and no permission id, cannot freeze; fall back to delegate
+            if prefer_freeze_first and is_control and perm_id is None:
+                prefer_freeze_first = False
+            if prefer_freeze_first:
+                # Attempt HTTP freeze first (includes Permission_id)
+                if is_control and perm_id is not None:
+                    txid = self._http_freeze_delegate_resource(owner_addr, receiver_addr, amt_sun, resource, signing_pk, perm_id)
+                    if txid:
+                        method_used = "http_freeze"
+                if not txid:
+                    # Builder freeze
                     try:
-                        builder = self.client.trx.delegate_resource(owner_addr, receiver_addr, amt_sun, resource)
-                    except (TypeError, AttributeError):
-                        builder = self.client.trx.delegate_resource(owner_addr, amt_sun, resource=resource, receiver=receiver_addr)  # type: ignore
-                except (AttributeError, RuntimeError):
-                    builder = self.client.trx.freeze_balance(owner_addr, amt_sun, duration=3, resource=resource, receiver=receiver_addr)
-                txn = builder.build()
-                try:
-                    if is_control and perm_id is not None:
-                        txn = txn.sign(signing_pk, permission_id=perm_id)
-                    else:
+                        try:
+                            builder = self.client.trx.freeze_balance(owner_addr, amt_sun, resource=resource, receiver=receiver_addr, lock_duration=3)
+                        except TypeError:
+                            try:
+                                builder = self.client.trx.freeze_balance(owner_addr, amt_sun, resource=resource, receiver=receiver_addr)
+                            except TypeError:
+                                builder = self.client.trx.freeze_balance(owner_addr, amt_sun, resource=resource)
+                        method_used = method_used or "freeze_balance"
+                        txn = builder.build()
+                        if is_control and perm_id is not None:
+                            txn = self._pre_sign_embed_permission(txn, perm_id)
                         txn = txn.sign(signing_pk)
-                except TypeError:
-                    txn = txn.sign(signing_pk)
-                result = txn.broadcast()
-                txid = result.get("txid") or result.get("txID")
+                        res_b = txn.broadcast()
+                        txid = res_b.get("txid") or res_b.get("txID")
+                    except Exception:
+                        txid = None
+            # Delegate path (either because not bandwidth or freeze-first failed)
+            if not txid:
+                if is_control and perm_id is not None:
+                    txid = self._http_delegate_resource(owner_addr, receiver_addr, amt_sun, resource, signing_pk, perm_id)
+                    if txid:
+                        method_used = method_used or "http_delegate"
+                if not txid:
+                    try:
+                        try:
+                            builder = self.client.trx.delegate_resource(owner_addr, receiver_addr, amt_sun, resource)
+                            method_used = method_used or "delegate_resource"
+                        except (TypeError, AttributeError):
+                            builder = self.client.trx.delegate_resource(owner_addr, amt_sun, resource=resource, receiver=receiver_addr)  # type: ignore
+                            method_used = method_used or "delegate_resource"
+                    except (AttributeError, RuntimeError):
+                        builder = None
+                    if builder is not None:
+                        txn = builder.build()
+                        if is_control and perm_id is not None:
+                            txn = self._pre_sign_embed_permission(txn, perm_id)
+                        try:
+                            txn = txn.sign(signing_pk)
+                        except TypeError:
+                            txn = txn.sign(signing_pk)
+                        res_b = txn.broadcast()
+                        txid = res_b.get("txid") or res_b.get("txID")
+            # Confirmation / effect-based success
             if txid and self._wait_for_transaction(txid, f"{resource} delegation", max_attempts=25, suppress_final_warning=True):
+                logger.info("[gas_station] %s delegation succeeded (method=%s, txid=%s, amount_trx=%.6f)", resource, method_used, txid, amount_trx)
+                tx_budget_remaining -= 1
                 return
-            # Effect-based fallback: check increase
-            try:
-                post_res = self._get_account_resources(receiver_addr)
-                if resource.upper() == "ENERGY" and post_res.get("energy_available", 0) > pre_res.get("energy_available", 0):
-                    logger.info(
-                        "[gas_station] %s delegation tx %s unconfirmed but ENERGY increased (%d -> %d); treating as success",
-                        resource,
-                        txid,
-                        pre_res.get("energy_available", 0),
-                        post_res.get("energy_available", 0),
-                    )
-                    return
-                if resource.upper() == "BANDWIDTH" and post_res.get("bandwidth_available", 0) > pre_res.get("bandwidth_available", 0):
-                    logger.info(
-                        "[gas_station] %s delegation tx %s unconfirmed but BANDWIDTH increased (%d -> %d); treating as success",
-                        resource,
-                        txid,
-                        pre_res.get("bandwidth_available", 0),
-                        post_res.get("bandwidth_available", 0),
-                    )
-                    return
-            except Exception:
-                pass
-            logger.error("[gas_station] %s delegation attempt unsuccessful (txid=%s)", resource, txid)
+            post_res = self._get_account_resources(receiver_addr)
+            if resource.upper() == "ENERGY" and post_res.get("energy_available", 0) > pre_res.get("energy_available", 0):
+                logger.info("[gas_station] ENERGY delegation unconfirmed but effect detected (%d->%d)", pre_res.get("energy_available", 0), post_res.get("energy_available", 0))
+                tx_budget_remaining -= 1
+                return
+            if resource.upper() == "BANDWIDTH":
+                pre_bw = pre_res.get("bandwidth_available", 0)
+                post_bw = post_res.get("bandwidth_available", 0)
+                delta_bw = post_bw - pre_bw
+                if delta_bw > 0:
+                    threshold = max(25, int(expected_missing_units * 0.5))
+                    if delta_bw >= threshold or post_bw >= pre_bw + expected_missing_units:
+                        logger.info("[gas_station] BANDWIDTH delegation unconfirmed but effect detected +%d >= threshold %d", delta_bw, threshold)
+                        tx_budget_remaining -= 1
+                        return
+                    else:
+                        logger.warning("[gas_station] BANDWIDTH delegation insufficient +%d < threshold %d (missing=%d)", delta_bw, threshold, expected_missing_units)
+            logger.error("[gas_station] %s delegation attempt unsuccessful (txid=%s, method=%s, amount_trx=%.6f, miss=%d)", resource, txid, method_used, amount_trx, expected_missing_units)
 
-        # ENERGY first then BANDWIDTH respecting remaining budget
-        if energy_trx > 0 and tx_budget_remaining > 0:
-            logger.info(
-                "[gas_station] Single-shot ENERGY delegation %.6f TRX (missing %d / yield≈%.1f * safety %.2f)",
-                energy_trx,
-                miss_e,
-                e_yield,
-                safety_mult,
-            )
-            _delegate(energy_trx, "ENERGY")
-            tx_budget_remaining -= 1
-        if bw_trx > 0 and tx_budget_remaining > 0:
-            logger.info(
-                "[gas_station] Single-shot BANDWIDTH delegation %.6f TRX (missing %d / yield≈%.1f * safety %.2f)",
-                bw_trx,
-                miss_bw,
-                bw_yield,
-                safety_mult,
-            )
-            _delegate(bw_trx, "BANDWIDTH")
-            tx_budget_remaining -= 1
+        if energy_trx > 0 and include_energy and tx_budget_remaining > 0:
+            logger.info("[gas_station] ENERGY delegation plan %.6f TRX (missing %d / yield≈%.1f * safety %.2f)", energy_trx, miss_e, e_yield, safety_mult)
+            _delegate(energy_trx, "ENERGY", miss_e)
+        if bw_trx > 0 and include_bandwidth and tx_budget_remaining > 0:
+            logger.info("[gas_station] BANDWIDTH delegation plan %.6f TRX (missing %d / mode=1to1 safety=%.2f)", bw_trx, miss_bw, safety_mult)
+            _delegate(bw_trx, "BANDWIDTH", miss_bw)
 
     def _ensure_minimum_resources_for_usdt(
         self,
