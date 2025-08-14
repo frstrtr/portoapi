@@ -1766,37 +1766,101 @@ async def process_free_gas_confirm(message: types.Message, state: FSMContext):
             await message.answer("\n".join(lines), parse_mode="Markdown")
             
         else:
-            # Error message with diagnostics
-            error_lines = [
-                "❌ **Не удалось подготовить адрес**",
-                "",
-                f"🎯 **Адрес:** `{addr}`",
-                f"⏱️ **Время попытки:** {result['execution_time']:.3f}с"
-            ]
-            
-            # Add specific error details
-            details = result.get("details", {})
-            if "error" in details:
-                error_lines.extend([
-                    "",
-                    f"🔍 **Ошибка:** {details['error']}"
-                ])
-            
-            if "activation_error" in details:
-                error_lines.extend([
-                    "",
-                    f"🔧 **Проблема активации:** {details['activation_error']}"
-                ])
-            
-            if "delegation_error" in details:
-                error_lines.extend([
-                    "",
-                    f"⚡ **Проблема ресурсов:** {details['delegation_error']}"
-                ])
-            
-            # Show current status if available
+            # Handle partial success or complete failure
+            strategy = result.get("strategy", "preparation_failed")
             final_status = result.get("final_status", {})
-            if final_status:
+            
+            if strategy == "partial_preparation":
+                # Partial success - show what was accomplished
+                lines = [
+                    "⚠️ **Адрес частично подготовлен**",
+                    "",
+                    f"🎯 **Адрес:** `{addr}`",
+                    f"⏱️ **Время выполнения:** {result['execution_time']:.3f}с"
+                ]
+                
+                # Show progress made
+                if final_status.get("energy_gained", 0) > 0 or final_status.get("bandwidth_gained", 0) > 0:
+                    lines.extend([
+                        "",
+                        "📈 **Достигнутый прогресс:**"
+                    ])
+                    if final_status.get("energy_gained", 0) > 0:
+                        lines.append(f"• Energy: +{final_status['energy_gained']:,} units")
+                    if final_status.get("bandwidth_gained", 0) > 0:
+                        lines.append(f"• Bandwidth: +{final_status['bandwidth_gained']:,} units")
+                
+                # Show current status
+                if final_status:
+                    lines.extend([
+                        "",
+                        "📊 **Текущее состояние:**",
+                        f"• Energy: {final_status.get('energy_available', 0):,} units",
+                        f"• Bandwidth: {final_status.get('bandwidth_available', 0):,} units"
+                    ])
+                    
+                    if final_status.get("is_activated", False):
+                        lines.append("• ✅ Адрес активирован")
+                    else:
+                        lines.append("• ❌ Адрес не активирован")
+                
+                lines.extend([
+                    "",
+                    "💡 **Попробуйте:**",
+                    "• /permission_status - диагностика системы",
+                    "• Повторить через несколько минут",
+                    "• Обратиться к администратору"
+                ])
+                
+                await message.answer("\n".join(lines), parse_mode="Markdown")
+                
+            else:
+                # Complete failure - show diagnostics
+                error_lines = [
+                    "❌ **Не удалось подготовить адрес**",
+                    "",
+                    f"🎯 **Адрес:** `{addr}`",
+                    f"⏱️ **Время попытки:** {result['execution_time']:.3f}с"
+                ]
+                
+                # Add specific error details
+                details = result.get("details", {})
+                if "error" in details:
+                    error_lines.extend([
+                        "",
+                        f"🔍 **Ошибка:** {details['error']}"
+                    ])
+                
+                if "activation_error" in details:
+                    error_lines.extend([
+                        "",
+                        f"🔧 **Проблема активации:** {details['activation_error']}"
+                    ])
+                
+                if "delegation_error" in details:
+                    error_lines.extend([
+                        "",
+                        f"⚡ **Проблема ресурсов:** {details['delegation_error']}"
+                    ])
+                
+                # Show current status if available
+                if final_status:
+                    error_lines.extend([
+                        "",
+                        "📊 **Текущее состояние:**",
+                        f"• Energy: {final_status.get('energy_available', 0):,} units",
+                        f"• Bandwidth: {final_status.get('bandwidth_available', 0):,} units"
+                    ])
+                
+                error_lines.extend([
+                    "",
+                    "💡 **Попробуйте:**",
+                    "• /permission_status - диагностика системы",
+                    "• Повторить через несколько минут",
+                    "• Обратиться к администратору"
+                ])
+                
+                await message.answer("\n".join(error_lines), parse_mode="Markdown")
                 error_lines.extend([
                     "",
                     "📊 **Текущее состояние:**",
