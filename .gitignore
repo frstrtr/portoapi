@@ -263,3 +263,127 @@ out/
 target/
 .env.backup*
 tests/*.json
+
+# ================================
+# SECURITY: Sensitive Data Prevention
+# ================================
+
+# Environment files (CRITICAL - Contains private keys, tokens, secrets)
+.env
+.env.*
+!.env.example
+!.env.development.template
+*.env
+env/
+.environment
+
+# Private keys and crypto files
+*private*key*
+*secret*
+*mnemonic*
+*seed*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Wallet and crypto related
+wallet/
+wallets/
+keystore/
+*.wallet
+*.dat
+account_*.json
+wallet_*.json
+private_*.json
+
+# Test and development scripts with potential sensitive data
+*activation*.py
+test_*.py
+permission_*.py
+*_demo.py
+*_test.py
+real_*.py
+live_*.py
+prod_*.py
+
+# Temporary and backup files
+*.bak
+*.bak.*
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Log files (may contain sensitive information)
+*.log
+logs/
+log/
+*.out
+*.err
+
+# Database files (may contain sensitive data)
+*.db
+*.sqlite
+*.sqlite3
+database/
+db/
+
+# Archive and backup directories
+archive/
+backup/
+backups/
+temp/
+tmp/
+
+# Process and runtime files
+*.pid
+*.sock
+.ngrok/
+ngrok.yml
+
+# Development artifacts
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE and editor files
+.vscode/settings.json
+.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Package files
+*.tar.gz
+*.zip
+*.rar
+*.7z

@@ -1680,22 +1680,144 @@ async def process_free_gas_confirm(message: types.Message, state: FSMContext):
     if choice not in {"да", "yes", "y"}:
         await message.answer("Ответьте 'да' или 'нет'.")
         return
-    # Perform actual preparation
+    
+    # Perform intelligent preparation
     try:
-        ok = prepare_for_sweep(addr)
-    except Exception as e:  # pragma: no cover
-        logger.warning(f"prepare_for_sweep failed for {addr}: {e}")
-        ok = False
-    if ok:
+        # Use the new intelligent preparation method
         try:
-            # Record usage best-effort
-            db = _get_bot_db(message)
-            record_free_gas_address(db, message.from_user.id, addr)
-        except Exception:  # noqa: BLE001
+            from core.services.gas_station import gas_station as _gs
+        except ImportError:
+            from src.core.services.gas_station import gas_station as _gs
+        
+        # Send processing message
+        processing_msg = await message.answer("🔄 **Подготовка адреса...**\n⏳ Анализ и активация с точным расчетом ресурсов...", parse_mode="Markdown")
+        
+        # Execute intelligent preparation
+        logger.info(f"[bot] Starting intelligent preparation for {addr}")
+        result = _gs.intelligent_prepare_address_for_usdt(addr)
+        
+        # Record usage if successful
+        if result["success"]:
+            try:
+                db = _get_bot_db(message)
+                record_free_gas_address(db, message.from_user.id, addr)
+            except Exception:
+                pass
+        
+        # Delete processing message
+        try:
+            await processing_msg.delete()
+        except Exception:
             pass
-        await message.answer("✅ Адрес активирован и ресурсы делегированы (или уже были достаточны).")
-    else:
-        await message.answer("❌ Не удалось выполнить операцию. Попробуйте позже.")
+        
+        # Prepare detailed response
+        if result["success"]:
+            # Success message with detailed breakdown
+            lines = [
+                "✅ **Адрес успешно подготовлен для USDT переводов!**",
+                "",
+                f"🎯 **Адрес:** `{addr}`",
+                f"⏱️ **Время выполнения:** {result['execution_time']:.3f}с"
+            ]
+            
+            # Activation details
+            if result["activation_performed"]:
+                method_emoji = "🔐" if result["activation_method"] == "permission_based" else "🔧"
+                method_name = "Permission-Based" if result["activation_method"] == "permission_based" else "Traditional"
+                lines.extend([
+                    "",
+                    f"{method_emoji} **Активация:** {method_name}"
+                ])
+                if result["transaction_ids"]:
+                    lines.append(f"📋 **Транзакция:** `{result['transaction_ids'][0][:16]}...`")
+            else:
+                lines.extend([
+                    "",
+                    "ℹ️ **Активация:** Адрес уже был активирован"
+                ])
+            
+            # Resource delegation details
+            sim_data = result["simulation_data"]
+            final_status = result["final_status"]
+            
+            lines.extend([
+                "",
+                "⚡ **Ресурсы (симуляция USDT перевода):**",
+                f"• Energy: {final_status['energy_available']:,} units (требуется: {sim_data.get('energy_used', 0):,})",
+                f"• Bandwidth: {final_status['bandwidth_available']:,} units (требуется: {sim_data.get('bandwidth_used', 0):,})"
+            ])
+            
+            if result["resources_delegated"]["energy"] > 0 or result["resources_delegated"]["bandwidth"] > 0:
+                lines.extend([
+                    "",
+                    "🎁 **Делегированные ресурсы:**"
+                ])
+                if result["resources_delegated"]["energy"] > 0:
+                    lines.append(f"• Energy: +{result['resources_delegated']['energy']:,} units")
+                if result["resources_delegated"]["bandwidth"] > 0:
+                    lines.append(f"• Bandwidth: +{result['resources_delegated']['bandwidth']:,} units")
+            
+            lines.extend([
+                "",
+                "🎉 **Статус:** Готов к USDT переводам!",
+                "💡 **Хватит на:** ~1 перевод USDT с запасом"
+            ])
+            
+            await message.answer("\n".join(lines), parse_mode="Markdown")
+            
+        else:
+            # Error message with diagnostics
+            error_lines = [
+                "❌ **Не удалось подготовить адрес**",
+                "",
+                f"🎯 **Адрес:** `{addr}`",
+                f"⏱️ **Время попытки:** {result['execution_time']:.3f}с"
+            ]
+            
+            # Add specific error details
+            details = result.get("details", {})
+            if "error" in details:
+                error_lines.extend([
+                    "",
+                    f"🔍 **Ошибка:** {details['error']}"
+                ])
+            
+            if "activation_error" in details:
+                error_lines.extend([
+                    "",
+                    f"🔧 **Проблема активации:** {details['activation_error']}"
+                ])
+            
+            if "delegation_error" in details:
+                error_lines.extend([
+                    "",
+                    f"⚡ **Проблема ресурсов:** {details['delegation_error']}"
+                ])
+            
+            # Show current status if available
+            final_status = result.get("final_status", {})
+            if final_status:
+                error_lines.extend([
+                    "",
+                    "📊 **Текущее состояние:**",
+                    f"• Energy: {final_status.get('energy_available', 0):,} units",
+                    f"• Bandwidth: {final_status.get('bandwidth_available', 0):,} units"
+                ])
+            
+            error_lines.extend([
+                "",
+                "� **Попробуйте:**",
+                "• `/permission_status` - диагностика системы",
+                "• Повторить через несколько минут",
+                "• Обратиться к администратору"
+            ])
+            
+            await message.answer("\n".join(error_lines), parse_mode="Markdown")
+    
+    except Exception as e:
+        logger.exception(f"[bot] Error in intelligent free gas preparation: {e}")
+        await message.answer("❌ Произошла ошибка при подготовке адреса. Попробуйте позже или обратитесь к администратору.")
+    
     await state.clear()
 
 
@@ -1741,4 +1863,363 @@ async def handle_dry_free_gas(message: types.Message):
     if notes:
         lines.append("Заметки: " + ", ".join(notes))
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# --- Permission-Based Activation Command ---
+async def handle_permission_activation(message: types.Message):
+    """Handle /permission_activate command with intelligent preparation."""
+    text = message.text or ""
+    parts = text.split()
+    
+    if len(parts) == 1:
+        await message.answer(
+            "🔐 **Intelligent Permission-Based Activation**\n\n"
+            "Использование: `/permission_activate <TRON_address>`\n"
+            "Пример: `/permission_activate T[TARGET_ADDRESS]`\n\n"
+            "**Что это делает:**\n"
+            "• Анализирует текущее состояние адреса\n"
+            "• Симулирует USDT перевод для точного расчета ресурсов\n"
+            "• Активирует адрес через permission-based систему\n"
+            "• Делегирует точно рассчитанные energy и bandwidth\n"
+            "• Проверяет готовность для USDT переводов\n\n"
+            "**Преимущества:**\n"
+            "• Умная система с точным расчетом\n"
+            "• Безопасное делегирование с margins\n"
+            "• Полная диагностика процесса\n"
+            "• Готовность именно для USDT операций\n\n"
+            "Проверить доступность: `/permission_status`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Extract target address
+    target_address = parts[1].strip()
+    
+    # Validate TRON address format
+    if not _is_valid_tron_address(target_address):
+        await message.answer(
+            "❌ **Некорректный TRON адрес**\n\n"
+            "Адрес должен:\n"
+            "• Начинаться с 'T'\n"
+            "• Иметь правильную Base58 кодировку\n"
+            "• Иметь корректную контрольную сумму\n\n"
+            "Пример: `TXb8AYmGgPRuXovkm1wsVwKfAvrbrHQ1Lo`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Show processing message
+    processing_msg = await message.answer(
+        "🔄 **Умная подготовка адреса...**\n"
+        "⏳ Анализ → Симуляция → Активация → Делегация → Проверка",
+        parse_mode="Markdown"
+    )
+    
+    try:
+        # Get gas station manager
+        try:
+            from core.services.gas_station import gas_station as _gs
+        except ImportError:
+            from src.core.services.gas_station import gas_station as _gs
+        
+        # Record usage for this user
+        try:
+            db = _get_bot_db(message)
+            record_free_gas_address(db, message.from_user.id, target_address)
+        except Exception:
+            pass
+        
+        # Perform intelligent preparation with full analysis
+        logger.info(f"[bot] Starting intelligent permission activation for {target_address}")
+        result = _gs.intelligent_prepare_address_for_usdt(target_address, probe_first=True)
+        
+        # Delete processing message
+        try:
+            await processing_msg.delete()
+        except:
+            pass
+        
+        # Handle results with detailed breakdown
+        if result["success"]:
+            # Comprehensive success message
+            lines = [
+                "✅ **Адрес успешно подготовлен для USDT!**",
+                "",
+                f"🎯 **Адрес:** `{target_address}`",
+                f"⏱️ **Время выполнения:** {result['execution_time']:.3f}с"
+            ]
+            
+            # Activation details
+            if result["activation_performed"]:
+                method_emoji = "🔐" if result["activation_method"] == "permission_based" else "🔧"
+                method_name = "Permission-Based" if result["activation_method"] == "permission_based" else "Traditional"
+                lines.extend([
+                    "",
+                    f"**� Активация:**",
+                    f"{method_emoji} Метод: {method_name}"
+                ])
+                if result["transaction_ids"]:
+                    lines.append(f"📋 Транзакция: `{result['transaction_ids'][0][:20]}...`")
+            else:
+                lines.extend([
+                    "",
+                    "**ℹ️ Активация:** Адрес уже был активирован"
+                ])
+            
+            # Simulation and resource details
+            sim_data = result["simulation_data"]
+            final_status = result["final_status"]
+            details = result.get("details", {})
+            
+            lines.extend([
+                "",
+                "**🔬 Анализ USDT перевода:**",
+                f"• Требуется Energy: {sim_data.get('energy_used', 0):,} units",
+                f"• Требуется Bandwidth: {sim_data.get('bandwidth_used', 0):,} units"
+            ])
+            
+            if "required_energy" in details and "required_bandwidth" in details:
+                lines.extend([
+                    f"• С margins Energy: {details['required_energy']:,} units",
+                    f"• С margins Bandwidth: {details['required_bandwidth']:,} units"
+                ])
+            
+            lines.extend([
+                "",
+                "**⚡ Итоговые ресурсы:**",
+                f"• Energy доступно: {final_status['energy_available']:,} units",
+                f"• Bandwidth доступно: {final_status['bandwidth_available']:,} units"
+            ])
+            
+            # Delegation details
+            if result["resources_delegated"]["energy"] > 0 or result["resources_delegated"]["bandwidth"] > 0:
+                lines.extend([
+                    "",
+                    "**🎁 Делегированные ресурсы:**"
+                ])
+                if result["resources_delegated"]["energy"] > 0:
+                    lines.append(f"• Energy: +{result['resources_delegated']['energy']:,} units")
+                if result["resources_delegated"]["bandwidth"] > 0:
+                    lines.append(f"• Bandwidth: +{result['resources_delegated']['bandwidth']:,} units")
+            
+            # Status check
+            ready = final_status.get("ready_for_usdt", False)
+            lines.extend([
+                "",
+                f"**{'🎉' if ready else '⚠️'} Статус:** {'Готов для USDT переводов' if ready else 'Недостаточно ресурсов'}",
+                "💡 **Покрытие:** ~1 USDT перевод с запасом"
+            ])
+            
+            await message.answer("\n".join(lines), parse_mode="Markdown")
+            
+        else:
+            # Comprehensive error message with diagnostics
+            error_lines = [
+                "❌ **Умная подготовка не удалась**",
+                "",
+                f"🎯 **Адрес:** `{target_address}`",
+                f"⏱️ **Время попытки:** {result['execution_time']:.3f}с"
+            ]
+            
+            # Add detailed error analysis
+            details = result.get("details", {})
+            sim_data = result.get("simulation_data", {})
+            final_status = result.get("final_status", {})
+            
+            # Show what we learned during analysis
+            if sim_data:
+                error_lines.extend([
+                    "",
+                    "**🔬 Анализ выполнен:**",
+                    f"• USDT перевод требует: {sim_data.get('energy_used', 0):,} Energy, {sim_data.get('bandwidth_used', 0):,} Bandwidth"
+                ])
+            
+            if final_status:
+                error_lines.extend([
+                    "",
+                    "**📊 Текущее состояние:**",
+                    f"• Energy: {final_status.get('energy_available', 0):,} units",
+                    f"• Bandwidth: {final_status.get('bandwidth_available', 0):,} units"
+                ])
+            
+            # Specific error details
+            if "error" in details:
+                error_lines.extend([
+                    "",
+                    f"**🔍 Основная ошибка:** {details['error']}"
+                ])
+            
+            if result["activation_performed"] and result["activation_method"] == "permission_based":
+                error_lines.extend([
+                    "",
+                    "✅ **Активация:** Выполнена успешно",
+                    "❌ **Проблема:** В делегировании ресурсов"
+                ])
+            elif "activation_error" in details:
+                error_lines.extend([
+                    "",
+                    f"❌ **Проблема активации:** {details['activation_error']}"
+                ])
+            
+            if "delegation_error" in details:
+                error_lines.extend([
+                    "",
+                    f"❌ **Проблема делегации:** {details['delegation_error']}"
+                ])
+            
+            error_lines.extend([
+                "",
+                "**💡 Рекомендации:**",
+                "• `/permission_status` - диагностика системы",
+                "• Повторить через несколько минут",
+                "• Проверить баланс газовой станции",
+                "• Обратиться к администратору"
+            ])
+            
+            await message.answer("\n".join(error_lines), parse_mode="Markdown")
+            
+    except Exception as e:
+        # Delete processing message if still exists
+        try:
+            await processing_msg.delete()
+        except:
+            pass
+        
+        logger.exception(f"[bot] Error in intelligent permission activation: {e}")
+        await message.answer(
+            "❌ **Критическая ошибка**\n\n"
+            f"Произошла ошибка при обработке команды.\n"
+            f"Адрес: `{target_address}`\n\n"
+            "Попробуйте:\n"
+            "• Повторить команду через минуту\n"
+            "• Использовать `/permission_status` для диагностики\n"
+            "• Обратиться к администратору",
+            parse_mode="Markdown"
+        )
+            
+    except Exception as e:
+        # Delete processing message
+        try:
+            await processing_msg.delete()
+        except:
+            pass
+        
+        logger.exception(f"Error in handle_permission_activation: {e}")
+        
+        await message.answer(
+            "❌ **Критическая ошибка**\n\n"
+            f"Произошла непредвиденная ошибка: `{str(e)}`\n\n"
+            "**Что делать:**\n"
+            "• Попробуйте позже\n"
+            "• Используйте `/free_gas` как альтернативу\n"
+            "• Обратитесь в поддержку\n\n"
+            "Проверить статус: `/permission_status`",
+            parse_mode="Markdown"
+        )
+
+
+async def handle_permission_status(message: types.Message):
+    """Handle /permission_status command to check permission-based activation availability."""
+    processing_msg = await message.answer("🔄 **Проверка статуса системы...**", parse_mode="Markdown")
+    
+    try:
+        # Get gas station manager
+        try:
+            from core.services.gas_station import gas_station as _gs
+        except ImportError:
+            from src.core.services.gas_station import gas_station as _gs
+        
+        # Check availability
+        status = _gs.is_permission_based_activation_available()
+        
+        # Delete processing message
+        try:
+            await processing_msg.delete()
+        except:
+            pass
+        
+        # Format status message
+        if status["available"]:
+            lines = [
+                "✅ **Permission-Based Activation: ДОСТУПНА**",
+                "",
+                "🔐 **Система готова к работе**",
+                "Все компоненты настроены корректно.",
+                ""
+            ]
+            
+            details = status.get("details", {})
+            if details:
+                lines.append("**📊 Конфигурация:**")
+                if details.get('gas_station_address'):
+                    lines.append(f"• Газовая станция: `{details['gas_station_address']}`")
+                if details.get('signer_address'):
+                    lines.append(f"• Подписывающий: `{details['signer_address']}`")
+                if details.get('gas_station_balance'):
+                    lines.append(f"• Баланс станции: {details['gas_station_balance']} TRX")
+                if details.get('required_balance'):
+                    lines.append(f"• Требуемый баланс: {details['required_balance']} TRX")
+                if details.get('permission_name'):
+                    lines.append(f"• Permission: {details['permission_name']} (ID: 2)")
+                if details.get('permission_threshold'):
+                    lines.append(f"• Threshold: {details['permission_threshold']}")
+                lines.append("")
+            
+            lines.extend([
+                "**🚀 Как использовать:**",
+                "`/permission_activate <TRON_address>`",
+                "",
+                "**Пример:**",
+                "`/permission_activate T[YOUR_ADDRESS]`"
+            ])
+            
+        else:
+            lines = [
+                "❌ **Permission-Based Activation: НЕДОСТУПНА**",
+                "",
+                "🔧 **Проблемы конфигурации:**"
+            ]
+            
+            issues = status.get("issues", [])
+            for issue in issues:
+                lines.append(f"• {issue}")
+            
+            lines.extend([
+                "",
+                "**💡 Что делать:**",
+                "• Обратитесь к администратору для настройки",
+                "• Используйте альтернативу: `/free_gas`",
+                "• Проверьте статус позже"
+            ])
+            
+            details = status.get("details", {})
+            if details:
+                lines.extend([
+                    "",
+                    "**📊 Обнаруженная конфигурация:**"
+                ])
+                if details.get('gas_station_address'):
+                    lines.append(f"• Газовая станция: `{details['gas_station_address']}`")
+                if details.get('signer_address'):
+                    lines.append(f"• Подписывающий: `{details['signer_address']}`")
+                if details.get('gas_station_balance') is not None:
+                    lines.append(f"• Баланс станции: {details['gas_station_balance']} TRX")
+        
+        await message.answer("\n".join(lines), parse_mode="Markdown")
+        
+    except Exception as e:
+        # Delete processing message
+        try:
+            await processing_msg.delete()
+        except:
+            pass
+        
+        logger.exception(f"Error in handle_permission_status: {e}")
+        
+        await message.answer(
+            "❌ **Ошибка проверки статуса**\n\n"
+            f"Не удалось проверить статус системы: `{str(e)}`\n\n"
+            "Попробуйте позже или обратитесь в поддержку.",
+            parse_mode="Markdown"
+        )
 

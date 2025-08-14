@@ -167,6 +167,15 @@ async def main():
     log_and_handle(seller_handlers.handle_free_gas, "FreeGas"),
     lambda m: m.text in {"FreeGas", "Free Gas", "⛽️ Free Gas ⛽️", "/freegas", "/freeGas"},
     )
+    # Permission-based activation commands
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_permission_activation, "/permission_activate"),
+        lambda m: m.text and m.text.startswith("/permission_activate"),
+    )
+    dp.message.register(
+        log_and_handle(seller_handlers.handle_permission_status, "/permission_status"),
+        lambda m: m.text == "/permission_status",
+    )
     # Free Gas dry-run
     dp.message.register(
         log_and_handle(seller_handlers.handle_dry_free_gas, "/dryfreegas"),

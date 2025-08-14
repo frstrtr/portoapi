@@ -595,14 +595,18 @@ class GasStationManager:
         return self._sign_and_broadcast_node_tx(tx, signer_pk, permission_id)
 
     def _http_freeze_delegate_resource(self, owner_addr: str, receiver_addr: str, amount_sun: int, resource: str, signer_pk: PrivateKey, permission_id: int | None) -> str | None:
-        """Freeze (stake) TRX to delegate resources via node-built transaction including Permission_id.
-        Tries freezebalancev2 first (modern), then legacy freezebalance. Returns txid or None."""
-        # Build payload for v2
+        """Freeze (stake) TRX to delegate resources via 3-step process with proper permission_id.
+        Step 1: Create unsigned transaction with /wallet/freezebalancev2
+        Step 2: Sign transaction locally with gas station key  
+        Step 3: Broadcast signed transaction
+        Returns txid or None.
+        """
+        # Step 1: Create unsigned delegation transaction
         payload_v2 = {
             "owner_address": owner_addr,
             "receiver_address": receiver_addr,
             "resource": resource.upper(),
-            "freeze_balance": int(amount_sun),
+            "frozen_balance": int(amount_sun),
             "visible": True,
         }
         if permission_id is not None:
@@ -612,9 +616,10 @@ class GasStationManager:
                 payload_v2["Permission_id"] = pid
             except Exception:
                 pass
+        
         tx, _ = self._http_local_remote("POST", "/wallet/freezebalancev2", payload=payload_v2, timeout=10)
         if not tx or not isinstance(tx, dict) or not tx.get("txID"):
-            # Fallback legacy endpoint
+            # Fallback to legacy endpoint if v2 fails
             payload_legacy = {
                 "owner_address": owner_addr,
                 "receiver_address": receiver_addr,
@@ -632,8 +637,11 @@ class GasStationManager:
                     pass
             tx, _ = self._http_local_remote("POST", "/wallet/freezebalance", payload=payload_legacy, timeout=10)
             if not tx or not isinstance(tx, dict) or not tx.get("txID"):
+                logger.error("[gas_station] Failed to create delegation transaction for %s", resource)
                 return None
-        return self._sign_and_broadcast_node_tx(tx, signer_pk, permission_id)
+        
+        # Step 2 & 3: Sign and broadcast using manual process
+        return self._manual_sign_and_broadcast(tx, signer_pk, permission_id)
 
     def _http_undelegate_resource(self, owner_addr: str, receiver_addr: str, amount_sun: int, resource: str, signer_pk: PrivateKey, permission_id: int | None) -> str | None:
         payload = {
@@ -902,6 +910,271 @@ class GasStationManager:
         if not self._gas_wallet_address:
             _ = self._get_gas_wallet_account()
         return self._gas_wallet_address
+
+    def activate_address_with_permission(self, target_address: str) -> dict:
+        """
+        Activate a TRON address using permission-based delegation.
+        
+        This method implements the modern permission-based approach where:
+        - Gas station wallet provides TRX resources
+        - Signer wallet provides authorization via permission_id=2
+        - Uses TronPy's native permission system for secure delegation
+        
+        Args:
+            target_address: The TRON address to activate
+            
+        Returns:
+            dict: {
+                "success": bool,
+                "transaction_id": str or None,
+                "message": str,
+                "method": str,
+                "execution_time": float,
+                "details": dict
+            }
+        """
+        import time
+        import os
+        from dotenv import load_dotenv
+        
+        start_time = time.time()
+        
+        try:
+            # Load environment variables for signer key
+            load_dotenv()
+            signer_private_key_hex = os.getenv('SIGNER_WALLET_PRIVATE_KEY')
+            if not signer_private_key_hex:
+                return {
+                    "success": False,
+                    "transaction_id": None,
+                    "message": "SIGNER_WALLET_PRIVATE_KEY not configured in environment",
+                    "method": "permission_based",
+                    "execution_time": time.time() - start_time,
+                    "details": {"error": "missing_signer_key"}
+                }
+            
+            # Check if activation is needed
+            if self._check_address_exists(target_address):
+                return {
+                    "success": True,
+                    "transaction_id": None,
+                    "message": f"Address {target_address} is already activated",
+                    "method": "permission_based",
+                    "execution_time": time.time() - start_time,
+                    "details": {"already_activated": True}
+                }
+            
+            # Get gas station credentials
+            gas_station_key = self._get_gas_wallet_private_key()
+            gas_station_address = gas_station_key.public_key.to_base58check_address()
+            
+            # Load signer key
+            signer_key = PrivateKey(bytes.fromhex(signer_private_key_hex))
+            signer_address = signer_key.public_key.to_base58check_address()
+            
+            # Check gas station resources
+            resources = self._get_account_resources(gas_station_address)
+            required_trx = getattr(self.tron_config, 'auto_activation_amount', 1.0)
+            
+            if resources['details']['balance_trx'] < required_trx:
+                return {
+                    "success": False,
+                    "transaction_id": None,
+                    "message": f"Insufficient gas station balance: {resources['details']['balance_trx']} TRX < {required_trx} TRX required",
+                    "method": "permission_based",
+                    "execution_time": time.time() - start_time,
+                    "details": {
+                        "balance": resources['details']['balance_trx'],
+                        "required": required_trx
+                    }
+                }
+            
+            # Create permission-based transaction using TronPy's native system
+            logger.info("[gas_station] Creating permission-based activation transaction")
+            logger.info("[gas_station] Gas station (resource provider): %s", gas_station_address)
+            logger.info("[gas_station] Signer (authorization provider): %s", signer_address)
+            logger.info("[gas_station] Target address: %s", target_address)
+            
+            # Use TronPy's native permission system
+            amount_sun = int(required_trx * 1e6)
+            
+            # Build transaction with permission_id=2 BEFORE building
+            txn_builder = self.client.trx.transfer(
+                from_=gas_station_address,
+                to=target_address,
+                amount=amount_sun
+            ).permission_id(2)  # Critical: Set permission BEFORE build()
+            
+            # Build and sign with signer key
+            built_txn = txn_builder.build()
+            signed_txn = built_txn.sign(signer_key)  # TronPy handles permission validation
+            
+            # Broadcast transaction
+            logger.info("[gas_station] Broadcasting permission-based transaction...")
+            response = signed_txn.broadcast()
+            
+            execution_time = time.time() - start_time
+            
+            if response.get('result'):
+                txid = response.get('txid')
+                logger.info("[gas_station] Permission-based activation successful: %s (tx: %s)", target_address, txid)
+                
+                # Fast confirmation using timed_activation.py approach
+                confirmation_start = time.time()
+                max_wait = 30  # seconds
+                confirmed = False
+                verification_interval = 0.5  # Fast polling like timed_activation.py
+                
+                while time.time() - confirmation_start < max_wait:
+                    time.sleep(verification_interval)
+                    if self._check_address_exists(target_address):
+                        confirmed = True
+                        break
+                
+                return {
+                    "success": True,
+                    "transaction_id": txid,
+                    "message": f"Address {target_address} activated successfully using permission-based delegation",
+                    "method": "permission_based",
+                    "execution_time": execution_time,
+                    "details": {
+                        "gas_station": gas_station_address,
+                        "signer": signer_address,
+                        "amount_trx": required_trx,
+                        "permission_id": 2,
+                        "confirmed": confirmed,
+                        "confirmation_time": time.time() - confirmation_start if confirmed else None
+                    }
+                }
+            else:
+                error_msg = response.get('message', 'Unknown broadcast error')
+                logger.error("[gas_station] Permission-based activation failed: %s", error_msg)
+                
+                return {
+                    "success": False,
+                    "transaction_id": None,
+                    "message": f"Broadcast failed: {error_msg}",
+                    "method": "permission_based",
+                    "execution_time": execution_time,
+                    "details": {
+                        "broadcast_response": response,
+                        "error": error_msg
+                    }
+                }
+                
+        except Exception as e:
+            execution_time = time.time() - start_time
+            logger.error("[gas_station] Permission-based activation error: %s", str(e))
+            
+            return {
+                "success": False,
+                "transaction_id": None,
+                "message": f"Activation failed: {str(e)}",
+                "method": "permission_based",
+                "execution_time": execution_time,
+                "details": {
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                }
+            }
+
+    def is_permission_based_activation_available(self) -> dict:
+        """
+        Check if permission-based activation is properly configured and available.
+        
+        Returns:
+            dict: {
+                "available": bool,
+                "issues": list of str,
+                "details": dict
+            }
+        """
+        import os
+        from dotenv import load_dotenv
+        
+        issues = []
+        details = {}
+        
+        try:
+            # Check environment configuration
+            load_dotenv()
+            signer_key_hex = os.getenv('SIGNER_WALLET_PRIVATE_KEY')
+            
+            if not signer_key_hex:
+                issues.append("SIGNER_WALLET_PRIVATE_KEY not set in environment")
+            else:
+                try:
+                    signer_key = PrivateKey(bytes.fromhex(signer_key_hex))
+                    signer_address = signer_key.public_key.to_base58check_address()
+                    details['signer_address'] = signer_address
+                except Exception as e:
+                    issues.append(f"Invalid SIGNER_WALLET_PRIVATE_KEY: {str(e)}")
+            
+            # Check gas station configuration
+            try:
+                gas_station_key = self._get_gas_wallet_private_key()
+                gas_station_address = gas_station_key.public_key.to_base58check_address()
+                details['gas_station_address'] = gas_station_address
+            except Exception as e:
+                issues.append(f"Gas station private key not available: {str(e)}")
+            
+            # Check permission configuration if both keys are available
+            if 'signer_address' in details and 'gas_station_address' in details:
+                try:
+                    # Get gas station account permissions
+                    permissions = self._fetch_account_permissions(details['gas_station_address'])
+                    
+                    # Look for permission ID 2
+                    permission_found = False
+                    signer_authorized = False
+                    
+                    for perm in permissions.get('active_permissions', []):
+                        if perm.get('id') == 2:
+                            permission_found = True
+                            details['permission_name'] = perm.get('permission_name', 'unnamed')
+                            details['permission_threshold'] = perm.get('threshold', 0)
+                            
+                            # Check if signer is in the permission
+                            for key in perm.get('keys', []):
+                                if key.get('address') == details['signer_address']:
+                                    signer_authorized = True
+                                    details['signer_weight'] = key.get('weight', 0)
+                                    break
+                    
+                    if not permission_found:
+                        issues.append("Permission ID 2 not found on gas station account")
+                    elif not signer_authorized:
+                        issues.append(f"Signer {details['signer_address']} not authorized in permission ID 2")
+                    else:
+                        details['permission_configured'] = True
+                        
+                except Exception as e:
+                    issues.append(f"Failed to check permission configuration: {str(e)}")
+            
+            # Check gas station balance
+            if 'gas_station_address' in details:
+                try:
+                    resources = self._get_account_resources(details['gas_station_address'])
+                    balance = resources['details']['balance_trx']
+                    details['gas_station_balance'] = balance
+                    
+                    required = getattr(self.tron_config, 'auto_activation_amount', 1.0)
+                    details['required_balance'] = required
+                    
+                    if balance < required:
+                        issues.append(f"Insufficient gas station balance: {balance} TRX < {required} TRX required")
+                        
+                except Exception as e:
+                    issues.append(f"Failed to check gas station balance: {str(e)}")
+            
+        except Exception as e:
+            issues.append(f"Configuration check failed: {str(e)}")
+        
+        return {
+            "available": len(issues) == 0,
+            "issues": issues,
+            "details": details
+        }
 
     # -------------------------------
     # Permissions inspection helpers
@@ -1706,6 +1979,7 @@ class GasStationManager:
         Notes:
         - JSON parse errors (e.g., empty body) from flaky nodes are logged at DEBUG to avoid noise.
         - Callers may pass a lower max_attempts for low-risk ops like resource delegation.
+        - Uses fast 0.5s polling interval for improved confirmation speed.
         """
         logger.info("Waiting for %s transaction: %s", operation, txid)
         for attempt in range(max_attempts):
@@ -1819,7 +2093,8 @@ class GasStationManager:
                     else:
                         logger.warning("Fallback tx lookup error (attempt %d/%d): %s", attempt + 1, max_attempts, fe)
 
-            time.sleep(2)
+            # Fast polling interval for improved confirmation speed (matches timed_activation.py approach)
+            time.sleep(0.5)
 
         # Avoid scary ERROR for delegation/activation operations; nodes sometimes omit tx info even when effects land
         op_lower = (operation or "").lower()
@@ -1832,9 +2107,134 @@ class GasStationManager:
                 logger.error("%s failed or timed out: %s", operation, txid)
         return False
 
+    def _check_address_exists(self, address: str) -> bool:
+        """Check if an address exists (is activated) on the TRON network."""
+        try:
+            account_data, _ = self._http_local_remote("POST", "/wallet/getaccount", 
+                                                    payload={"address": address, "visible": True}, 
+                                                    timeout=5)
+            return bool(account_data and account_data.get("address"))
+        except Exception:
+            return False
+
+    def check_account_activated_with_details(self, address: str) -> tuple[bool, dict]:
+        """
+        Fast account activation check with detailed response (inspired by timed_activation.py).
+        Returns (is_activated, account_data) for comprehensive verification.
+        """
+        try:
+            account_info = self.client.get_account(address)
+            # Handle TRON API response as dict, not object attributes (corrected approach from timed_activation.py)
+            if account_info and isinstance(account_info, dict) and 'address' in account_info:
+                return True, account_info
+            return False, None
+        except Exception:
+            return False, None
+
+    def get_account_activation_requirements(self, target_address: str) -> dict:
+        """Calculate the real costs and benefits of activating a TRON account.
+        
+        Returns detailed breakdown of:
+        - TRX burn cost for account creation
+        - Bandwidth requirements and available free bandwidth after activation
+        - Net resource gains from activation
+        
+        Based on TRON network parameters:
+        - Account creation burns: 0.1 TRX (mainnet) or 1.0 TRX (testnet)
+        - Activated accounts get 600 free daily bandwidth
+        - CreateAccount transaction uses ~267 bytes bandwidth
+        """
+        try:
+            # Check if account already exists
+            exists = self._check_address_exists(target_address)
+            if exists:
+                return {
+                    "activation_needed": False,
+                    "account_exists": True,
+                    "message": "Account already activated"
+                }
+            
+            # TRON account activation costs (network-dependent)
+            # Mainnet: 0.1 TRX, Testnet: 1 TRX burned for account creation
+            if self.tron_config.network == "mainnet":
+                activation_burn_sun = 100000  # 0.1 TRX burned by network for account creation
+            else:  # testnet/nile
+                activation_burn_sun = 1000000  # 1.0 TRX burned by network for account creation (testnet)
+            
+            create_account_bandwidth = 267  # Bandwidth needed for CreateAccount transaction
+            free_bandwidth_after_activation = 600  # Daily free bandwidth for activated accounts
+            
+            # Get current network bandwidth cost (for reference/comparison only)
+            try:
+                chain_params = self.get_chain_parameters()
+                bandwidth_price_sun = chain_params.get("getTransactionFee", 1000)  # SUN per bandwidth byte
+            except Exception:
+                bandwidth_price_sun = 1000  # Default fallback
+            
+            # Calculate net bandwidth benefit
+            bandwidth_cost_sun_if_purchased = create_account_bandwidth * bandwidth_price_sun
+            net_bandwidth_benefit = free_bandwidth_after_activation - create_account_bandwidth
+            
+            # For activation cost calculation: Only the TRX burn is actual cost
+            # Bandwidth should come from delegation (gas station's available bandwidth points)
+            # The bandwidth_cost is shown for reference but not included in delegation scenario
+            
+            return {
+                "activation_needed": True,
+                "account_exists": False,
+                "costs": {
+                    "activation_burn_sun": activation_burn_sun,
+                    "activation_burn_trx": activation_burn_sun / 1e6,
+                    "bandwidth_needed_bytes": create_account_bandwidth,
+                    "bandwidth_cost_if_purchased_sun": bandwidth_cost_sun_if_purchased,
+                    "bandwidth_cost_if_purchased_trx": bandwidth_cost_sun_if_purchased / 1e6,
+                    "total_cost_with_delegation_sun": activation_burn_sun,  # Only TRX burn when using delegation
+                    "total_cost_with_delegation_trx": activation_burn_sun / 1e6,
+                    "total_cost_if_purchased_sun": activation_burn_sun + bandwidth_cost_sun_if_purchased,
+                    "total_cost_if_purchased_trx": (activation_burn_sun + bandwidth_cost_sun_if_purchased) / 1e6
+                },
+                "benefits": {
+                    "free_daily_bandwidth": free_bandwidth_after_activation,
+                    "net_bandwidth_gain": net_bandwidth_benefit,
+                    "bandwidth_value_sun": net_bandwidth_benefit * bandwidth_price_sun,
+                    "bandwidth_value_trx": (net_bandwidth_benefit * bandwidth_price_sun) / 1e6
+                },
+                "method_comparison": {
+                    "create_account": {
+                        "description": "Direct account creation (recommended)",
+                        "cost_sun": activation_burn_sun,
+                        "cost_trx": activation_burn_sun / 1e6,
+                        "bandwidth_used": create_account_bandwidth,
+                        "note": "Burns TRX, bandwidth from delegation"
+                    },
+                    "transfer": {
+                        "description": "TRX transfer activation (fallback)",
+                        "cost_sun": activation_burn_sun + bandwidth_cost_sun_if_purchased,
+                        "cost_trx": (activation_burn_sun + bandwidth_cost_sun_if_purchased) / 1e6,
+                        "bandwidth_used": create_account_bandwidth,
+                        "note": "More expensive, requires transfer + bandwidth purchase"
+                    }
+                },
+                "recommendations": {
+                    "preferred_method": "create_account",
+                    "cost_effective": (activation_burn_sun / 1e6) < 2.0,  # Reasonable activation cost
+                    "bandwidth_positive": net_bandwidth_benefit > 0
+                }
+            }
+            
+        except Exception as e:
+            logger.error("Failed to calculate activation requirements: %s", e)
+            return {
+                "activation_needed": True,
+                "account_exists": False,
+                "error": str(e),
+                "fallback_cost_trx": 0.1  # Conservative estimate
+            }
+
     def _get_account_resources(self, address: str) -> dict:
         """Return current account resources: energy/bandwidth available.
         Bandwidth combines free and paid (delegated) bandwidth.
+        Accounts the 600 daily free bandwidth for activated accounts.
         """
         try:
             acc = self.client.get_account_resource(address)
@@ -1846,12 +2246,14 @@ class GasStationManager:
             except Exception:
                 pass
             acc = {}
+        
         try:
             energy_limit = int(acc.get("EnergyLimit", 0))
             energy_used = int(acc.get("EnergyUsed", 0))
         except (TypeError, ValueError):
             energy_limit = 0
             energy_used = 0
+            
         try:
             free_limit = int(acc.get("freeNetLimit", 0))
             free_used = int(acc.get("freeNetUsed", 0))
@@ -1859,9 +2261,54 @@ class GasStationManager:
             paid_used = int(acc.get("NetUsed", 0))
         except (TypeError, ValueError):
             free_limit = free_used = paid_limit = paid_used = 0
+        
+        # For activated accounts, ensure minimum 600 free bandwidth daily
+        # TRON gives every activated account 600 free bandwidth per day
+        if free_limit == 0 and paid_limit == 0:
+            # Account might not be activated or has no resources
+            # Check if account exists by trying to get basic account info
+            try:
+                account_data, _ = self._http_local_remote("POST", "/wallet/getaccount", 
+                                                        payload={"address": address, "visible": True}, 
+                                                        timeout=3)
+                account_exists = bool(account_data and account_data.get("address"))
+                if account_exists:
+                    # Account exists but may not have used bandwidth yet
+                    # Set minimum 600 free bandwidth for activated accounts
+                    free_limit = max(free_limit, 600)
+            except Exception:
+                pass
+        
         energy_avail = max(0, energy_limit - energy_used)
         bandwidth_avail = max(0, (free_limit - free_used) + (paid_limit - paid_used))
-        return {"energy_available": energy_avail, "bandwidth_available": bandwidth_avail}
+        
+        # Also get TRX balance from account data
+        balance_trx = 0
+        try:
+            account_data, _ = self._http_local_remote("POST", "/wallet/getaccount", 
+                                                    payload={"address": address, "visible": True}, 
+                                                    timeout=3)
+            if account_data and "balance" in account_data:
+                balance_sun = account_data["balance"]
+                balance_trx = balance_sun / 1e6
+        except Exception:
+            pass
+        
+        result = {
+            "energy_available": energy_avail, 
+            "bandwidth_available": bandwidth_avail,
+            "details": {
+                "energy_limit": energy_limit,
+                "energy_used": energy_used,
+                "free_bandwidth_limit": free_limit,
+                "free_bandwidth_used": free_used,
+                "paid_bandwidth_limit": paid_limit,
+                "paid_bandwidth_used": paid_used,
+                "balance_trx": balance_trx
+            }
+        }
+        
+        return result
 
     def _get_incoming_delegation_summary(self, to_address: str, from_address: str) -> dict:
         """Return summary of incoming delegations to 'to_address' from 'from_address'.
@@ -1942,6 +2389,32 @@ class GasStationManager:
             if fnl > 0:
                 return True
         return False
+
+    def _calculate_precise_bandwidth(self, raw_data_hex: str) -> int:
+        """Calculate precise bandwidth points needed for a transaction.
+        Formula: (Length of raw_data_hex string / 2) + 65 bytes
+        The raw_data_hex length is divided by 2 to get bytes, plus 65 bytes for ECDSA signature.
+        """
+        try:
+            if not raw_data_hex:
+                return 0
+            # Remove '0x' prefix if present
+            hex_str = raw_data_hex.lower()
+            if hex_str.startswith('0x'):
+                hex_str = hex_str[2:]
+            # Return 0 if no actual hex data after prefix removal
+            if not hex_str:
+                return 0
+            # Calculate bytes from hex string length and add signature overhead
+            raw_data_bytes = len(hex_str) // 2
+            signature_bytes = 65
+            total_bandwidth = raw_data_bytes + signature_bytes
+            logger.debug("[gas_station] Precise bandwidth calculation: %d raw bytes + %d signature = %d total", 
+                        raw_data_bytes, signature_bytes, total_bandwidth)
+            return total_bandwidth
+        except Exception as e:
+            logger.warning("[gas_station] Failed to calculate precise bandwidth: %s", e)
+            return 0
 
     def _estimate_bandwidth_units_per_trx(self) -> int:
         """Estimate bandwidth units yielded per 1 TRX staked based on live chain parameters.
@@ -2357,31 +2830,42 @@ class GasStationManager:
         except (requests.RequestException, ValueError):
             return {"getEnergyFee": None, "getTransactionFee": None}
 
-    def estimate_usdt_transfer_resources(self, from_address: str, to_address: str | None = None, amount_usdt: float = 1.0) -> dict:
-        """Simulate USDT transfer to estimate energy and bandwidth usage and potential burn cost.
-        Returns dict with keys: energy_used, bandwidth_used, cost_sun, cost_trx, fees {getEnergyFee, getTransactionFee}.
+    def estimate_usdt_energy_precise(self, from_address: str, to_address: str | None = None, amount_usdt: float = 1.0) -> dict:
+        """Get precise energy estimation for USDT transfer using triggerconstantcontract simulation.
+        
+        Returns dict with:
+        - energy_used: Exact energy needed (32k for existing USDT holders, ~65k for new)
+        - bandwidth_used: Precise bandwidth from transaction size  
+        - recipient_has_usdt: Whether recipient already holds USDT
+        - simulation_success: Whether the simulation was successful
         """
         base = self.tron_config.get_tron_client_config().get("full_node")
         if not base or not from_address:
-            return {"energy_used": 0, "bandwidth_used": 0, "cost_sun": 0, "cost_trx": 0.0, "fees": {}}
+            return {"energy_used": 0, "bandwidth_used": 0, "recipient_has_usdt": False, "simulation_success": False}
+        
         if not to_address:
             try:
                 to_address = self.get_gas_wallet_address()
             except Exception:
-                to_address = self.tron_config.usdt_contract  # last resort, still valid address
-        # Encode parameters per ABI: address (20 bytes without 0x41) + uint256 amount
+                to_address = self.tron_config.usdt_contract
+        
+        # Encode USDT transfer parameters per ABI: transfer(address,uint256)
         to_hex = self._b58_to_hex(to_address) or ""
         if to_hex.startswith("41"):
-            to_hex_20 = to_hex[2:]
+            to_hex_20 = to_hex[2:]  # Remove 41 prefix for contract parameter
         else:
             to_hex_20 = to_hex
         to_hex_20 = (to_hex_20 or "").lower().zfill(64)
+        
         try:
-            amount_smallest = int(round(float(amount_usdt) * 1_000_000))
+            amount_smallest = int(round(float(amount_usdt) * 1_000_000))  # USDT has 6 decimals
         except (TypeError, ValueError):
-            amount_smallest = 1_000_000
+            amount_smallest = 1_000_000  # 1 USDT default
+        
         amount_hex = hex(amount_smallest)[2:].lower().zfill(64)
         encoded_parameter = to_hex_20 + amount_hex
+        
+        # Use triggerconstantcontract for precise energy estimation
         payload = {
             "owner_address": from_address,
             "contract_address": self.tron_config.usdt_contract,
@@ -2390,38 +2874,300 @@ class GasStationManager:
             "visible": True,
             "call_value": 0,
         }
+        
         energy_used = 0
-        net_usage = 0
+        bandwidth_used = 0
+        simulation_success = False
+        
         try:
-            j, _ = self._http_local_remote("POST", "/wallet/triggerconstantcontract", payload=payload, timeout=8)
-            if j:
+            # Simulate the contract execution
+            result, _ = self._http_local_remote("POST", "/wallet/triggerconstantcontract", payload=payload, timeout=8)
+            if result:
+                energy_used = int(result.get("energy_used", 0) or 0)
+                simulation_success = True
+                logger.info("[gas_station] USDT energy simulation: %d energy for %s -> %s", 
+                           energy_used, from_address[:8] + "...", to_address[:8] + "...")
+                
+                # Also get precise bandwidth by creating the actual transaction
                 try:
-                    energy_used = int(j.get("energy_used", 0) or 0)
-                except (TypeError, ValueError):
-                    energy_used = 0
-                # Bandwidth/bytes
-                try:
-                    net_usage = int(j.get("transaction", {}).get("net_usage", 0) or 0)
-                except (TypeError, ValueError):
-                    net_usage = int(j.get("net_usage", 0) or 0) if isinstance(j.get("net_usage", 0), int) else 0
-        except (requests.RequestException, ValueError):
-            energy_used = 0
-            net_usage = 0
-        # Fee calculation
+                    tx_payload = payload.copy()
+                    tx_resp, _ = self._http_local_remote("POST", "/wallet/triggersmartcontract", payload=tx_payload, timeout=8)
+                    if tx_resp and tx_resp.get("transaction") and tx_resp["transaction"].get("raw_data_hex"):
+                        raw_data_hex = tx_resp["transaction"]["raw_data_hex"]
+                        bandwidth_used = self._calculate_precise_bandwidth(raw_data_hex)
+                except Exception as e:
+                    logger.debug("[gas_station] Failed to get precise bandwidth, using fallback: %s", e)
+                    bandwidth_used = int(result.get("transaction", {}).get("net_usage", 0) or 0)
+                    
+        except Exception as e:
+            logger.warning("[gas_station] USDT energy simulation failed: %s", e)
+            energy_used = int(getattr(self.tron_config, "usdt_energy_per_transfer_estimate", 32000) or 32000)
+            bandwidth_used = int(getattr(self.tron_config, "usdt_bandwidth_per_transfer_estimate", 345) or 345)
+        
+        # Determine if recipient has USDT (affects energy cost)
+        # ~32k energy = recipient has USDT, ~65k = new USDT holder
+        recipient_has_usdt = energy_used < 50000 if energy_used > 0 else None
+        
+        return {
+            "energy_used": energy_used,
+            "bandwidth_used": bandwidth_used,
+            "recipient_has_usdt": recipient_has_usdt,
+            "simulation_success": simulation_success,
+            "from_address": from_address,
+            "to_address": to_address,
+            "amount_usdt": amount_usdt
+        }
+    def simulate_usdt_transfer(self, from_address: str, to_address: str | None = None, amount_usdt: float = 1.0) -> dict:
+        """Simulate USDT transfer to estimate energy and bandwidth usage and potential burn cost.
+        Returns dict with keys: energy_used, bandwidth_used, cost_sun, cost_trx, fees {getEnergyFee, getTransactionFee}.
+        Uses precise energy estimation via triggerconstantcontract and precise bandwidth calculation.
+        """
+        # Use the new precise energy estimation method
+        energy_result = self.estimate_usdt_energy_precise(from_address, to_address, amount_usdt)
+        
+        # Get fee parameters for cost calculation
         fees = self._get_chain_fee_params()
         e_fee = fees.get("getEnergyFee") or 0
         b_fee = fees.get("getTransactionFee") or 0
+        
+        energy_used = energy_result["energy_used"]
+        bandwidth_used = energy_result["bandwidth_used"]
+        
         try:
-            total_sun = int(energy_used) * int(e_fee) + int(net_usage) * int(b_fee)
+            total_sun = int(energy_used) * int(e_fee) + int(bandwidth_used) * int(b_fee)
         except (TypeError, ValueError):
             total_sun = 0
+        
         return {
             "energy_used": int(energy_used),
-            "bandwidth_used": int(net_usage),
+            "bandwidth_used": int(bandwidth_used),
             "cost_sun": int(total_sun),
             "cost_trx": float(total_sun) / 1_000_000.0,
             "fees": fees,
+            "recipient_has_usdt": energy_result.get("recipient_has_usdt"),
+            "simulation_success": energy_result.get("simulation_success", False)
         }
+
+    def get_super_representative_data(self) -> dict:
+        """Fetch Super Representative data for staking yield calculations.
+        
+        Returns dict with:
+        - witnesses: List of all SRs with their votes and addresses
+        - total_votes: Sum of all votes across all SRs
+        - block_reward: Reward per block for block production
+        - vote_reward_per_block: Vote reward distributed per block
+        - daily_blocks: Number of blocks produced per day
+        """
+        try:
+            # Get chain parameters for reward information
+            chain_params, _ = self._http_local_remote("GET", "/wallet/getchainparameters", timeout=8)
+            
+            # Get SR list
+            witnesses_resp, _ = self._http_local_remote("GET", "/wallet/listwitnesses", timeout=8)
+            
+            if not witnesses_resp or "witnesses" not in witnesses_resp:
+                logger.warning("[gas_station] Failed to fetch SR data")
+                return {
+                    "witnesses": [],
+                    "total_votes": 0,
+                    "block_reward": 16_000_000,  # Default 16 TRX in SUN
+                    "vote_reward_per_block": 160_000_000,  # Default 160 TRX in SUN
+                    "daily_blocks": 28800  # 24h * 60m * 60s / 3s per block
+                }
+            
+            witnesses = witnesses_resp.get("witnesses", [])
+            total_votes = sum(int(w.get("voteCount", 0) or 0) for w in witnesses)
+            
+            # Parse chain parameters for rewards
+            block_reward = 16_000_000  # Default 16 TRX in SUN
+            vote_reward_per_block = 160_000_000  # Default 160 TRX in SUN
+            
+            if chain_params and "chainParameter" in chain_params:
+                for param in chain_params["chainParameter"]:
+                    key = str(param.get("key", ""))
+                    value = param.get("value")
+                    if key == "getWitnessPayPerBlock" and value:
+                        try:
+                            block_reward = int(value)
+                        except ValueError:
+                            pass
+            
+            daily_blocks = 28800  # 86400 seconds / 3 seconds per block
+            
+            logger.info("[gas_station] SR data: %d witnesses, %d total votes, %d TRX block reward", 
+                       len(witnesses), total_votes // 1_000_000, block_reward // 1_000_000)
+            
+            return {
+                "witnesses": witnesses,
+                "total_votes": total_votes,
+                "block_reward": block_reward,
+                "vote_reward_per_block": vote_reward_per_block,
+                "daily_blocks": daily_blocks,
+                "total_daily_vote_rewards": vote_reward_per_block * daily_blocks
+            }
+            
+        except Exception as e:
+            logger.warning("[gas_station] Failed to fetch SR data: %s", e)
+            return {
+                "witnesses": [],
+                "total_votes": 0,
+                "block_reward": 16_000_000,
+                "vote_reward_per_block": 160_000_000,
+                "daily_blocks": 28800
+            }
+
+    def calculate_staking_yield(self, sr_address: str, staked_trx: float, sr_commission_rate: float = 0.90) -> dict:
+        """Calculate estimated staking yield (APR) for voting for a specific Super Representative.
+        
+        Args:
+            sr_address: The SR's address to vote for
+            staked_trx: Amount of TRX to stake
+            sr_commission_rate: SR's sharing percentage (e.g., 0.90 for 90% sharing)
+            
+        Returns dict with:
+        - daily_reward_trx: Estimated daily reward in TRX
+        - annual_reward_trx: Estimated annual reward in TRX  
+        - apr_percent: Annual Percentage Rate
+        - sr_info: Information about the chosen SR
+        """
+        sr_data = self.get_super_representative_data()
+        
+        if not sr_data["witnesses"]:
+            return {
+                "daily_reward_trx": 0.0,
+                "annual_reward_trx": 0.0,
+                "apr_percent": 0.0,
+                "sr_info": None,
+                "error": "Could not fetch SR data"
+            }
+        
+        # Find the chosen SR
+        chosen_sr = None
+        for witness in sr_data["witnesses"]:
+            if witness.get("address") == sr_address:
+                chosen_sr = witness
+                break
+        
+        if not chosen_sr:
+            return {
+                "daily_reward_trx": 0.0,
+                "annual_reward_trx": 0.0,
+                "apr_percent": 0.0,
+                "sr_info": None,
+                "error": f"SR {sr_address} not found"
+            }
+        
+        sr_votes = int(chosen_sr.get("voteCount", 0) or 0)
+        total_votes = sr_data["total_votes"]
+        
+        if total_votes == 0 or sr_votes == 0:
+            return {
+                "daily_reward_trx": 0.0,
+                "annual_reward_trx": 0.0,
+                "apr_percent": 0.0,
+                "sr_info": chosen_sr,
+                "error": "No votes data available"
+            }
+        
+        # Calculate SR's share of network vote rewards
+        sr_vote_share = sr_votes / total_votes
+        total_daily_vote_rewards_sun = sr_data["total_daily_vote_rewards"]
+        sr_daily_income_sun = total_daily_vote_rewards_sun * sr_vote_share
+        sr_daily_income_trx = sr_daily_income_sun / 1_000_000.0
+        
+        # Calculate user's share of SR rewards
+        # Note: 1 frozen TRX = 1 vote
+        user_vote_share = staked_trx / sr_votes if sr_votes > 0 else 0
+        user_daily_reward_sun = sr_daily_income_sun * sr_commission_rate * user_vote_share
+        user_daily_reward_trx = user_daily_reward_sun / 1_000_000.0
+        
+        # Calculate annual values
+        annual_reward_trx = user_daily_reward_trx * 365
+        apr_percent = (annual_reward_trx / staked_trx * 100) if staked_trx > 0 else 0
+        
+        logger.info("[gas_station] Staking yield: %.2f TRX staked -> %.4f TRX/day (%.2f%% APR) with SR %s", 
+                   staked_trx, user_daily_reward_trx, apr_percent, chosen_sr.get("url", "")[:30])
+        
+        return {
+            "daily_reward_trx": user_daily_reward_trx,
+            "annual_reward_trx": annual_reward_trx,
+            "apr_percent": apr_percent,
+            "sr_info": {
+                "address": chosen_sr.get("address"),
+                "url": chosen_sr.get("url"),
+                "vote_count": sr_votes,
+                "vote_share_percent": sr_vote_share * 100,
+                "daily_income_trx": sr_daily_income_trx
+            },
+            "staked_trx": staked_trx,
+            "sr_commission_rate": sr_commission_rate
+        }
+
+    def calculate_energy_delegation_needed(self, target_address: str, required_energy: int | None = None) -> dict:
+        """Calculate TRX needed to delegate for specific energy requirements.
+        
+        Args:
+            target_address: Address that needs energy
+            required_energy: Specific energy amount needed, or None for USDT transfer estimation
+            
+        Returns dict with:
+        - required_energy: Energy needed
+        - energy_per_trx: Current network energy yield per frozen TRX
+        - trx_needed: TRX amount to freeze for delegation
+        - delegation_cost_sun: Cost in SUN
+        """
+        if required_energy is None:
+            # Estimate energy for USDT transfer
+            energy_sim = self.estimate_usdt_energy_precise(target_address)
+            required_energy = energy_sim.get("energy_used", 32000)
+            if required_energy == 0:
+                required_energy = 32000  # Conservative fallback
+        
+        # Get current energy yield from network parameters
+        params = self.get_global_resource_parameters()
+        energy_per_trx = params.get("dailyEnergyPerTrx", 300.0)
+        
+        if energy_per_trx <= 0:
+            energy_per_trx = float(getattr(self.tron_config, "energy_units_per_trx_estimate", 300.0) or 300.0)
+        
+        # Calculate TRX needed with safety margin
+        safety_multiplier = 1.2  # 20% safety margin
+        trx_needed = (required_energy / energy_per_trx) * safety_multiplier
+        trx_needed = max(1.0, trx_needed)  # Minimum 1 TRX
+        
+        delegation_cost_sun = int(trx_needed * 1_000_000)
+        
+        logger.info("[gas_station] Energy delegation calc: %d energy needed, %.2f energy/TRX, %.3f TRX to freeze", 
+                   required_energy, energy_per_trx, trx_needed)
+        
+        return {
+            "required_energy": required_energy,
+            "energy_per_trx": energy_per_trx,
+            "trx_needed": trx_needed,
+            "delegation_cost_sun": delegation_cost_sun,
+            "safety_multiplier": safety_multiplier,
+            "target_address": target_address
+        }
+
+    def get_precise_bandwidth_for_transaction(self, transaction_payload: dict) -> int:
+        """Get precise bandwidth requirement for any transaction by creating it and measuring size.
+        Args:
+            transaction_payload: The payload dict for creating the transaction (e.g., for triggersmartcontract)
+        Returns:
+            Precise bandwidth points needed (raw_data_hex_length/2 + 65)
+        """
+        try:
+            # Create the transaction to get raw_data_hex
+            tx_resp, _ = self._http_local_remote("POST", "/wallet/triggersmartcontract", payload=transaction_payload, timeout=8)
+            if tx_resp and tx_resp.get("transaction") and tx_resp["transaction"].get("raw_data_hex"):
+                raw_data_hex = tx_resp["transaction"]["raw_data_hex"]
+                return self._calculate_precise_bandwidth(raw_data_hex)
+            else:
+                logger.warning("[gas_station] Failed to get raw_data_hex from transaction creation")
+                return 0
+        except Exception as e:
+            logger.warning("[gas_station] Failed to get precise bandwidth for transaction: %s", e)
+            return 0
 
     def _delegate_resources(
         self,
@@ -2850,6 +3596,222 @@ class GasStationManager:
                 summary["txids"].append(txid)
         logger.info("[gas_station] reclaim_resources summary for %s: %s", receiver_addr, summary)
         return summary
+
+    def intelligent_prepare_address_for_usdt(self, target_address: str, *, probe_first: bool = True) -> dict:
+        """Intelligent free gas preparation using permission-based activation + precise resource delegation.
+        
+        This method implements the complete pipeline:
+        1. Probe target address for current activation and resource status
+        2. Simulate USDT transfer to calculate exact energy and bandwidth requirements  
+        3. Use permission-based activation if available (modern method)
+        4. Calculate and delegate precise resources needed based on simulation
+        5. Verify final readiness for USDT transfers
+        
+        Args:
+            target_address: Address to prepare for USDT transfers
+            probe_first: Whether to probe current status first (default: True)
+            
+        Returns:
+            dict with comprehensive status and execution details:
+            {
+                "success": bool,
+                "activation_performed": bool,
+                "activation_method": str,  # "permission_based" | "traditional" | "none" 
+                "resources_delegated": dict,  # {energy: int, bandwidth: int}
+                "simulation_data": dict,  # USDT transfer simulation results
+                "final_status": dict,  # Final readiness assessment
+                "execution_time": float,
+                "transaction_ids": list,
+                "details": dict  # Additional technical details
+            }
+        """
+        import time
+        start_time = time.time()
+        
+        result = {
+            "success": False,
+            "activation_performed": False,
+            "activation_method": "none",
+            "resources_delegated": {"energy": 0, "bandwidth": 0},
+            "simulation_data": {},
+            "final_status": {},
+            "execution_time": 0.0,
+            "transaction_ids": [],
+            "details": {},
+            "target_address": target_address
+        }
+        
+        try:
+            logger.info(f"[gas_station] Starting intelligent preparation for {target_address}")
+            
+            # Step 1: Initial probing and simulation
+            if probe_first:
+                logger.info(f"[gas_station] Step 1: Probing current status and simulating USDT transfer")
+                
+                # Check current account status
+                current_resources = self._get_account_resources(target_address)
+                is_activated = self._check_address_exists(target_address)
+                
+                # Simulate USDT transfer to determine precise requirements
+                simulation = self.simulate_usdt_transfer(target_address)
+                result["simulation_data"] = simulation
+                
+                logger.info(f"[gas_station] Simulation results: {simulation['energy_used']} energy, {simulation['bandwidth_used']} bandwidth needed")
+                
+                # Calculate requirements with safety margins
+                required_energy = int(simulation["energy_used"] * 1.15)  # 15% safety margin
+                required_bandwidth = int(simulation["bandwidth_used"] * 1.25)  # 25% safety margin
+                
+                # Minimum thresholds
+                required_energy = max(required_energy, 28000)  # Minimum for USDT
+                required_bandwidth = max(required_bandwidth, 350)  # Minimum for transactions
+                
+                result["details"]["required_energy"] = required_energy
+                result["details"]["required_bandwidth"] = required_bandwidth
+                result["details"]["is_activated"] = is_activated
+                result["details"]["current_resources"] = current_resources
+            
+            # Step 2: Permission-based activation if needed
+            activation_bonus_bw = 0
+            if not is_activated:
+                logger.info(f"[gas_station] Step 2: Address needs activation")
+                
+                # Try permission-based activation first
+                permission_status = self.is_permission_based_activation_available()
+                if permission_status["available"]:
+                    logger.info(f"[gas_station] Attempting permission-based activation")
+                    
+                    activation_result = self.activate_address_with_permission(target_address)
+                    if activation_result["success"]:
+                        result["activation_performed"] = True
+                        result["activation_method"] = "permission_based"
+                        result["transaction_ids"].append(activation_result.get("transaction_id"))
+                        activation_bonus_bw = 1500  # Typical bandwidth bonus from activation
+                        
+                        logger.info(f"[gas_station] Permission-based activation successful")
+                    else:
+                        logger.warning(f"[gas_station] Permission-based activation failed: {activation_result.get('message')}")
+                        # Fall back to traditional method
+                        try:
+                            traditional_result = self._activate_address(target_address)
+                            if traditional_result:
+                                result["activation_performed"] = True
+                                result["activation_method"] = "traditional"
+                                activation_bonus_bw = 1500
+                                logger.info(f"[gas_station] Traditional activation successful")
+                        except Exception as e:
+                            logger.error(f"[gas_station] Traditional activation also failed: {e}")
+                            result["details"]["activation_error"] = str(e)
+                else:
+                    logger.info(f"[gas_station] Permission-based activation not available, using traditional")
+                    try:
+                        traditional_result = self._activate_address(target_address)
+                        if traditional_result:
+                            result["activation_performed"] = True
+                            result["activation_method"] = "traditional"
+                            activation_bonus_bw = 1500
+                            logger.info(f"[gas_station] Traditional activation successful")
+                    except Exception as e:
+                        logger.error(f"[gas_station] Traditional activation failed: {e}")
+                        result["details"]["activation_error"] = str(e)
+            
+            # Step 3: Resource delegation based on simulation
+            logger.info(f"[gas_station] Step 3: Calculating and delegating precise resources")
+            
+            # Re-check resources after activation
+            post_activation_resources = self._get_account_resources(target_address)
+            current_energy = int(post_activation_resources.get("energy_available", 0) or 0)
+            current_bandwidth = int(post_activation_resources.get("bandwidth_available", 0) or 0) + activation_bonus_bw
+            
+            # Calculate missing resources
+            missing_energy = max(0, required_energy - current_energy)
+            missing_bandwidth = max(0, required_bandwidth - current_bandwidth)
+            
+            logger.info(f"[gas_station] Current: {current_energy} energy, {current_bandwidth} bandwidth")
+            logger.info(f"[gas_station] Missing: {missing_energy} energy, {missing_bandwidth} bandwidth")
+            
+            # Delegate resources if needed
+            if missing_energy > 0 or missing_bandwidth > 0:
+                try:
+                    owner_addr = self.get_gas_wallet_address()
+                    signing_pk = self._get_control_signer_private_key() or self._get_gas_wallet_private_key()
+                    
+                    if signing_pk:
+                        # Calculate TRX needed for delegation
+                        energy_calc = self.calculate_energy_delegation_needed(target_address, missing_energy) if missing_energy > 0 else {}
+                        
+                        # Use energy calculation for bandwidth estimation (roughly same yield ratios)
+                        bandwidth_trx_needed = 0.0
+                        if missing_bandwidth > 0:
+                            params = self.get_global_resource_parameters()
+                            bandwidth_per_trx = params.get("dailyBandwidthPerTrx", 1500.0)
+                            if bandwidth_per_trx <= 0:
+                                bandwidth_per_trx = 1500.0
+                            bandwidth_trx_needed = (missing_bandwidth / bandwidth_per_trx) * 1.2  # 20% safety margin
+                            bandwidth_trx_needed = max(1.0, bandwidth_trx_needed)
+                        
+                        # Delegate resources
+                        self._delegate_resources(
+                            owner_addr,
+                            target_address,
+                            signing_pk,
+                            target_energy_units=required_energy,
+                            target_bandwidth_units=required_bandwidth,
+                            include_energy=missing_energy > 0,
+                            include_bandwidth=missing_bandwidth > 0,
+                            tx_budget_remaining=3
+                        )
+                        
+                        result["resources_delegated"]["energy"] = missing_energy
+                        result["resources_delegated"]["bandwidth"] = missing_bandwidth
+                        result["details"]["energy_delegation_calc"] = energy_calc
+                        result["details"]["bandwidth_trx_needed"] = bandwidth_trx_needed
+                        
+                        logger.info(f"[gas_station] Resource delegation completed")
+                    else:
+                        logger.error(f"[gas_station] No signing key available for resource delegation")
+                        result["details"]["delegation_error"] = "No signing key available"
+                        
+                except Exception as e:
+                    logger.error(f"[gas_station] Resource delegation failed: {e}")
+                    result["details"]["delegation_error"] = str(e)
+            
+            # Step 4: Final verification
+            logger.info(f"[gas_station] Step 4: Final verification")
+            
+            final_resources = self._get_account_resources(target_address)
+            final_energy = int(final_resources.get("energy_available", 0) or 0)
+            final_bandwidth = int(final_resources.get("bandwidth_available", 0) or 0)
+            
+            # Check if address is ready for USDT transfers
+            energy_sufficient = final_energy >= (required_energy * 0.9)  # 90% threshold
+            bandwidth_sufficient = final_bandwidth >= (required_bandwidth * 0.9)  # 90% threshold
+            
+            result["final_status"] = {
+                "energy_available": final_energy,
+                "bandwidth_available": final_bandwidth,
+                "energy_required": required_energy,
+                "bandwidth_required": required_bandwidth,
+                "energy_sufficient": energy_sufficient,
+                "bandwidth_sufficient": bandwidth_sufficient,
+                "ready_for_usdt": energy_sufficient and bandwidth_sufficient
+            }
+            
+            result["success"] = energy_sufficient and bandwidth_sufficient
+            
+            logger.info(f"[gas_station] Final status: energy {final_energy}/{required_energy}, bandwidth {final_bandwidth}/{required_bandwidth}")
+            logger.info(f"[gas_station] Address ready for USDT: {result['success']}")
+            
+        except Exception as e:
+            logger.error(f"[gas_station] Intelligent preparation failed: {e}")
+            result["details"]["error"] = str(e)
+            result["success"] = False
+        
+        finally:
+            result["execution_time"] = time.time() - start_time
+            logger.info(f"[gas_station] Intelligent preparation completed in {result['execution_time']:.3f}s")
+            
+        return result
 
 # Global gas station instance
 gas_station = GasStationManager()
