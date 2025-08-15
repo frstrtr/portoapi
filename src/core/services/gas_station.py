@@ -1780,20 +1780,24 @@ class GasStationManager:
     # -------------------------------------------------
     def dry_run_prepare_for_sweep(self, target_address: str) -> dict:
         """Return a simulation of what prepare_for_sweep WOULD do without sending txs.
+        Uses modern technique with smart contract probing and precise calculations.
 
         Output dict keys:
           exists: bool                -> whether account appears active
           activation_needed: bool     -> would we attempt activation
-          activation_method: str|None -> 'transfer' | 'create_account' | None
+          activation_method: str|None -> 'permission_based' | 'transfer' | 'create_account' | None
           current: {energy, bandwidth}
           required: {energy, bandwidth}  (including safety buffers)
           missing: {energy, bandwidth}
+          simulation: dict            -> smart contract simulation results
+          recipient_analysis: dict    -> destination account balance analysis
           plan: {
              energy_trx: float,      -> TRX that would be delegated for ENERGY (0 if none)
              bandwidth_trx: float,   -> TRX that would be delegated for BANDWIDTH (0 if none)
              safety_multiplier: float,
              yields: {energy_per_trx, bandwidth_per_trx},
-             tx_budget_estimate: int
+             tx_budget_estimate: int,
+             delegation_method: str   -> 'permission_based' | 'traditional'
           }
           notes: list[str]           -> any caveats / fallbacks used
         """
@@ -1814,70 +1818,166 @@ class GasStationManager:
             except Exception:
                 notes.append("owner_address_unavailable")
 
-            # Account existence / activation need
-            exists = self._is_account_active(target_address)
+            # Modern approach: Check account existence and activation status
+            exists = self._check_address_exists(target_address) 
             activation_needed = not exists
-            # Choose hypothetical activation method
+            
+            # Determine activation method preference (modern: permission-based first)
             activation_method = None
             if activation_needed:
-                mode = getattr(self.tron_config, "account_activation_mode", "transfer")
-                activation_method = mode if mode in {"transfer", "create_account"} else "transfer"
+                # Check if permission-based activation is available
+                permission_status = self.is_permission_based_activation_available()
+                if permission_status["available"]:
+                    activation_method = "permission_based"
+                    notes.append("permission_based_activation_available")
+                else:
+                    # Fall back to traditional methods
+                    mode = getattr(self.tron_config, "account_activation_mode", "transfer")
+                    activation_method = mode if mode in {"transfer", "create_account"} else "transfer"
+                    notes.append("permission_based_activation_not_available")
+                    if permission_status.get("issues"):
+                        notes.extend([f"permission_issue: {issue}" for issue in permission_status["issues"][:2]])
 
-            # Current resources
+            # Current resources using precise account resource checking
             cur = self._get_account_resources(target_address)
             cur_e = int(cur.get("energy_available", 0) or 0)
             cur_bw = int(cur.get("bandwidth_available", 0) or 0)
 
-            # Simulate resource usage for one USDT transfer
+            # Modern technique: Use smart contract simulation for precise energy/bandwidth calculation
+            simulation = {}
+            recipient_analysis = {}
             try:
-                sim = self.estimate_usdt_transfer_resources(from_address=target_address, to_address=owner_addr or target_address, amount_usdt=1.0)
-                used_e = int(sim.get("energy_used", 0) or 0)
-                used_bw = int(sim.get("bandwidth_used", 0) or 0)
-            except Exception:  # noqa: BLE001
+                # Use the same precise estimation as the main gas-free function
+                # But handle fresh addresses properly - simulation needs existing addresses
+                if exists:
+                    # Address exists - use direct simulation
+                    sim = self.estimate_usdt_energy_precise(target_address, owner_addr, 1.0)
+                    simulation = sim
+                    used_e = int(sim.get("energy_used", 0) or 0)
+                    used_bw = int(sim.get("bandwidth_used", 0) or 0)
+                    notes.append(f"smart_contract_simulation_success: {sim.get('simulation_success', False)}")
+                    
+                    # Analyze recipient account for USDT balance (affects energy cost)
+                    if sim.get("recipient_has_usdt") is not None:
+                        recipient_analysis = {
+                            "has_usdt": sim["recipient_has_usdt"],
+                            "energy_category": "existing_holder" if sim["recipient_has_usdt"] else "new_holder",
+                            "expected_energy": "~32k" if sim["recipient_has_usdt"] else "~65k"
+                        }
+                        notes.append(f"recipient_usdt_status: {'existing' if sim['recipient_has_usdt'] else 'new'}_holder")
+                    else:
+                        recipient_analysis = {"has_usdt": None, "energy_category": "unknown"}
+                        notes.append("recipient_usdt_status_unknown")
+                else:
+                    # Fresh address - use a proxy simulation with gas wallet and analyze recipient
+                    if owner_addr:
+                        # Simulate from gas wallet to target to estimate cost
+                        proxy_sim = self.estimate_usdt_energy_precise(owner_addr, target_address, 1.0)
+                        simulation = proxy_sim
+                        used_e = int(proxy_sim.get("energy_used", 0) or 0)
+                        used_bw = int(proxy_sim.get("bandwidth_used", 0) or 0)
+                        notes.append(f"proxy_simulation_success: {proxy_sim.get('simulation_success', False)}")
+                        
+                        # For fresh addresses, recipient likely doesn't have USDT (new holder = higher energy)
+                        recipient_analysis = {
+                            "has_usdt": False,  # Fresh address unlikely to have USDT
+                            "energy_category": "new_holder",
+                            "expected_energy": "~65k"
+                        }
+                        notes.append("fresh_address_assumed_new_usdt_holder")
+                    else:
+                        # No owner address available for proxy simulation
+                        used_e = 0
+                        used_bw = 0
+                        simulation = {"energy_used": 0, "bandwidth_used": 0, "simulation_success": False}
+                        recipient_analysis = {"has_usdt": False, "energy_category": "new_holder"}
+                        notes.append("proxy_simulation_failed_no_owner")
+                    
+            except Exception as e:  # noqa: BLE001
                 used_e = 0
                 used_bw = 0
-                notes.append("transfer_simulation_failed")
+                recipient_analysis = {"error": str(e)}
+                notes.append("smart_contract_simulation_failed")
+                
+            # Fallback to network-appropriate estimates if simulation failed
             if used_e <= 0:
-                # Use network-appropriate USDT energy estimate (adapts to mainnet/testnet differences)
-                # Default to reasonable middle-ground that works across networks
-                used_e = int(getattr(self.tron_config, "usdt_energy_per_transfer_estimate", 25000) or 25000)
-                notes.append("energy_estimate_fallback")
+                # Use intelligent fallback based on recipient analysis
+                if recipient_analysis.get("energy_category") == "new_holder":
+                    # Fresh addresses are new USDT holders - need more energy (~65k)
+                    used_e = int(getattr(self.tron_config, "usdt_energy_per_transfer_estimate", 65000) or 65000)
+                    notes.append("energy_estimate_fallback_new_holder")
+                else:
+                    # Existing addresses or unknown - use conservative middle estimate
+                    used_e = int(getattr(self.tron_config, "usdt_energy_per_transfer_estimate", 32000) or 32000)
+                    notes.append("energy_estimate_fallback_existing_holder")
+                
             if used_bw <= 0:
                 used_bw = int(getattr(self.tron_config, "usdt_bandwidth_per_transfer_estimate", 345) or 345)
                 notes.append("bandwidth_estimate_fallback")
 
-            # Safety buffers (mirror _ensure_minimum_resources_for_usdt)
-            safety_e = int(max(3000, used_e * 0.15))
-            safety_bw = int(max(50, used_bw * 0.25))
+            # Safety buffers using modern calculation approach (matches main gas-free function)
+            safety_e = int(max(5000, used_e * 0.15))  # Minimum 5k buffer, 15% of usage
+            safety_bw = int(max(50, used_bw * 0.25))   # Minimum 50 buffer, 25% of usage
             required_e = used_e + safety_e
             required_bw = used_bw + safety_bw
 
-            activation_bonus_bw = 600 if activation_needed else 0
+            # Account for activation bonus bandwidth (modern: more precise estimate)
+            activation_bonus_bw = 1500 if activation_needed else 0  # Updated to realistic value
             effective_bw = cur_bw + activation_bonus_bw
             miss_e = max(0, required_e - cur_e)
             miss_bw = max(0, required_bw - effective_bw)
 
-            # Yields & safety
+            # Modern yield calculations using the same methods as main gas-free function
+            # Account for network type differences (testnet vs mainnet)
+            is_testnet = self.tron_config.network != "mainnet"
+            
             try:
-                e_yield = float(max(1, int(self.tron_config.energy_units_per_trx_estimate)))
+                # Use get_global_resource_parameters for accurate live yields (same as main function)
+                params = self.get_global_resource_parameters()
+                e_yield = params.get("dailyEnergyPerTrx", 2.38)
+                bw_yield = params.get("dailyBandwidthPerTrx", 1500.0)
+                
+                # Network-specific adjustments for bandwidth yield
+                if is_testnet:
+                    # Testnet often has unusual staking economics with very low bandwidth yields
+                    # Use a reasonable minimum for practical calculations
+                    if bw_yield < 10.0:  # Less than 10 bandwidth per TRX is impractical
+                        config_bw_yield = float(getattr(self.tron_config, "bandwidth_units_per_trx_estimate", 1500.0) or 1500.0)
+                        # For testnet, use a reasonable middle ground
+                        bw_yield = max(50.0, min(config_bw_yield, 200.0))  # 50-200 range for testnet
+                        notes.append(f"testnet_bandwidth_yield_adjusted_from_{params.get('dailyBandwidthPerTrx', 0):.3f}_to_{bw_yield}")
+                    else:
+                        notes.append("testnet_bandwidth_yield_acceptable")
+                else:
+                    # Mainnet: use live values but with sanity check
+                    if bw_yield < 100.0:
+                        config_bw_yield = float(getattr(self.tron_config, "bandwidth_units_per_trx_estimate", 1500.0) or 1500.0)
+                        notes.append(f"mainnet_bandwidth_yield_low_{bw_yield:.3f}_using_config_{config_bw_yield}")
+                        bw_yield = config_bw_yield
+                    else:
+                        notes.append("mainnet_bandwidth_yield_acceptable")
+                
+                notes.append(f"live_network_yields_used_network_{self.tron_config.network}")
             except Exception:  # noqa: BLE001
-                # Accurate energy yield: ~2.38 energy per TRX (100B daily energy / 42B frozen TRX)
-                e_yield = 2.38
-                notes.append("energy_yield_fallback")
-            try:
-                bw_yield = float(max(1, int(self._estimate_bandwidth_units_per_trx())))
-            except Exception:  # noqa: BLE001
-                try:
-                    bw_yield = float(max(1, int(self.tron_config.bandwidth_units_per_trx_estimate)))
-                except Exception:  # noqa: BLE001
-                    bw_yield = 1500.0
-                    notes.append("bandwidth_yield_fallback")
+                # Fallback to config estimates with network-appropriate values
+                e_yield = float(getattr(self.tron_config, "energy_units_per_trx_estimate", 2.38) or 2.38)
+                base_bw_yield = float(getattr(self.tron_config, "bandwidth_units_per_trx_estimate", 1500.0) or 1500.0)
+                
+                # Network-specific bandwidth adjustments for fallback
+                if is_testnet:
+                    bw_yield = max(50.0, min(base_bw_yield, 200.0))  # Conservative testnet range
+                    notes.append("testnet_config_yield_fallback")
+                else:
+                    bw_yield = base_bw_yield  # Full mainnet estimate
+                    notes.append("mainnet_config_yield_fallback")
+                    
             safety_mult = float(getattr(self.tron_config, "delegation_safety_multiplier", 1.1) or 1.1)
             try:
                 min_trx = max(1.0, float(getattr(self.tron_config, "min_delegate_trx", 1.0) or 1.0))
             except Exception:
                 min_trx = 1.0
                 notes.append("min_trx_fallback")
+                
             max_energy_cap = float(getattr(self.tron_config, "max_energy_delegation_trx_per_invoice", 0.0) or 0.0)
             max_bw_cap = float(getattr(self.tron_config, "max_bandwidth_delegation_trx_per_invoice", 0.0) or 0.0)
 
@@ -1893,6 +1993,119 @@ class GasStationManager:
             energy_trx = _calc(miss_e, e_yield, max_energy_cap)
             bandwidth_trx = _calc(miss_bw, bw_yield, max_bw_cap)
 
+            # Determine delegation method (modern: prefer permission-based)
+            delegation_method = "permission_based"
+            try:
+                signer_key = os.getenv('SIGNER_WALLET_PRIVATE_KEY')
+                if not signer_key:
+                    delegation_method = "traditional"
+                    notes.append("delegation_method_traditional_no_signer")
+                else:
+                    notes.append("delegation_method_permission_based")
+            except Exception:
+                delegation_method = "traditional"
+                notes.append("delegation_method_traditional_fallback")
+
+            # Enhanced wallet analysis: signer and gas wallet resource/cost breakdown
+            wallet_analysis = {}
+            try:
+                # Get signer wallet info (authorization provider)
+                signer_info = {}
+                if delegation_method == "permission_based":
+                    try:
+                        from dotenv import load_dotenv
+                        load_dotenv()
+                        signer_key_hex = os.getenv('SIGNER_WALLET_PRIVATE_KEY')
+                        if signer_key_hex:
+                            signer_pk = PrivateKey(bytes.fromhex(signer_key_hex))
+                            signer_address = signer_pk.public_key.to_base58check_address()
+                            signer_resources = self._get_account_resources(signer_address)
+                            
+                            signer_info = {
+                                "address": signer_address,
+                                "role": "authorization_provider",
+                                "current_resources": {
+                                    "energy": signer_resources.get("energy_available", 0),
+                                    "bandwidth": signer_resources.get("bandwidth_available", 0),
+                                    "balance_trx": signer_resources.get("details", {}).get("balance_trx", 0)
+                                },
+                                "estimated_costs": {
+                                    "activation_tx_bandwidth": 270 if activation_needed else 0,
+                                    "delegation_tx_bandwidth": 270 if (miss_e > 0 or miss_bw > 0) else 0,
+                                    "total_bandwidth_needed": (270 if activation_needed else 0) + (270 if (miss_e > 0 or miss_bw > 0) else 0),
+                                    "trx_burned": 0,  # Signer doesn't burn TRX, just signs
+                                    "notes": "Signs transactions but doesn't provide resources"
+                                }
+                            }
+                            notes.append("signer_wallet_analyzed")
+                    except Exception as e:
+                        signer_info = {"error": str(e), "role": "authorization_provider"}
+                        notes.append("signer_wallet_analysis_failed")
+                
+                # Get gas wallet info (resource provider)
+                gas_wallet_info = {}
+                try:
+                    gas_wallet_address = self.get_gas_wallet_address()
+                    gas_wallet_resources = self._get_account_resources(gas_wallet_address)
+                    
+                    # Calculate actual TRX costs for gas wallet
+                    # Activation: Only the transfer amount (auto_activation_amount), network handles burn automatically
+                    activation_trx = getattr(self.tron_config, 'auto_activation_amount', 1.0) if activation_needed else 0.0
+                    
+                    # Resource delegation: TRX gets FROZEN (not burned) to delegate resources
+                    # The TRX remains in gas wallet but frozen, can be unfrozen later
+                    frozen_energy_trx = energy_trx  # This TRX gets frozen for energy delegation
+                    frozen_bandwidth_trx = bandwidth_trx  # This TRX gets frozen for bandwidth delegation
+                    
+                    # Total TRX impact: activation transfer + frozen amounts
+                    total_trx_sent = activation_trx  # Only this leaves the wallet
+                    total_trx_frozen = frozen_energy_trx + frozen_bandwidth_trx  # This gets frozen in wallet
+                    total_trx_impact = total_trx_sent + total_trx_frozen  # Total balance impact
+                    
+                    gas_wallet_info = {
+                        "address": gas_wallet_address,
+                        "role": "resource_provider",
+                        "current_resources": {
+                            "energy": gas_wallet_resources.get("energy_available", 0),
+                            "bandwidth": gas_wallet_resources.get("bandwidth_available", 0),
+                            "balance_trx": gas_wallet_resources.get("details", {}).get("balance_trx", 0)
+                        },
+                        "estimated_costs": {
+                            "activation_transfer_trx": activation_trx,  # TRX sent to target (gone from wallet)
+                            "energy_delegation_frozen_trx": frozen_energy_trx,  # TRX frozen for energy (stays in wallet)
+                            "bandwidth_delegation_frozen_trx": frozen_bandwidth_trx,  # TRX frozen for bandwidth (stays in wallet)
+                            "total_trx_sent": total_trx_sent,  # Total TRX leaving wallet
+                            "total_trx_frozen": total_trx_frozen,  # Total TRX frozen in wallet
+                            "total_balance_impact": total_trx_impact,  # Total impact on available balance
+                            "sufficient_balance": gas_wallet_resources.get("details", {}).get("balance_trx", 0) >= (total_trx_impact + 1.0),  # +1 TRX buffer
+                            "notes": f"Sends {activation_trx} TRX activation + freezes {total_trx_frozen:.3f} TRX for delegation on {self.tron_config.network}"
+                        }
+                    }
+                    notes.append("gas_wallet_analyzed")
+                except Exception as e:
+                    gas_wallet_info = {"error": str(e), "role": "resource_provider"}
+                    notes.append("gas_wallet_analysis_failed")
+                
+                wallet_analysis = {
+                    "signer": signer_info,
+                    "gas_wallet": gas_wallet_info,
+                    "operation_summary": {
+                        "total_trx_sent": gas_wallet_info.get("estimated_costs", {}).get("total_trx_sent", 0),
+                        "total_trx_frozen": gas_wallet_info.get("estimated_costs", {}).get("total_trx_frozen", 0),
+                        "total_balance_impact": gas_wallet_info.get("estimated_costs", {}).get("total_balance_impact", 0),
+                        "network_type": self.tron_config.network,
+                        "delegation_method": delegation_method,
+                        "transactions_count": 1 + int(energy_trx > 0) + int(bandwidth_trx > 0),  # activation + delegations
+                        "signer_sufficient_bandwidth": signer_info.get("estimated_costs", {}).get("total_bandwidth_needed", 0) <= signer_info.get("current_resources", {}).get("bandwidth", 0) if signer_info else True,
+                        "gas_wallet_sufficient_balance": gas_wallet_info.get("estimated_costs", {}).get("sufficient_balance", False) if gas_wallet_info else False,
+                        "delegation_explanation": "TRX gets frozen (not burned) for resource delegation and can be unfrozen later"
+                    }
+                }
+                
+            except Exception as e:
+                wallet_analysis = {"error": str(e)}
+                notes.append("wallet_analysis_failed")
+
             return {
                 "exists": exists,
                 "activation_needed": activation_needed,
@@ -1900,12 +2113,16 @@ class GasStationManager:
                 "current": {"energy": cur_e, "bandwidth": cur_bw},
                 "required": {"energy": required_e, "bandwidth": required_bw},
                 "missing": {"energy": miss_e, "bandwidth": miss_bw},
+                "simulation": simulation,
+                "recipient_analysis": recipient_analysis,
+                "wallet_analysis": wallet_analysis,
                 "plan": {
                     "energy_trx": energy_trx,
                     "bandwidth_trx": bandwidth_trx,
                     "safety_multiplier": safety_mult,
                     "yields": {"energy_per_trx": e_yield, "bandwidth_per_trx": bw_yield},
                     "tx_budget_estimate": 1 + int(energy_trx > 0) + int(bandwidth_trx > 0),  # activation + delegations
+                    "delegation_method": delegation_method,
                 },
                 "notes": notes,
             }
